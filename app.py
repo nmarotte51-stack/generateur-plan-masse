@@ -102,6 +102,10 @@ with col_plan:
 with col_kpi:
     if result["message"]:
         st.error(result["message"])
+    if not k.get("stationnement_suffisant", True):
+        st.warning(f"Stationnement insuffisant : {k['logements_non_stationnes']} "
+                   f"logement(s) non stationne(s) dans cette poche. "
+                   f"La forme du terrain limite le nombre d'emplacements.")
     st.subheader("Indicateurs")
     a, b = st.columns(2)
     a.metric("Logements", k["nb_logements"])
@@ -114,4 +118,6 @@ with col_kpi:
     emprise = (k["surface_batie_m2"] / k["surface_parcelle_m2"] * 100) if k["surface_parcelle_m2"] else 0
     st.metric("Emprise au sol", f"{emprise:.1f} %")
 
-st.caption("Version moteur v1 - zone constructible robuste. Placement batiments/parking : heuristique a affiner.")
+st.caption("Moteur v1 - zone constructible robuste, stationnement 1:1:1 verifie, "
+           "cheminements pietons du parking vers la coursive de chaque batiment. "
+           "Placement batiments/parking : heuristique a affiner.")

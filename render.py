@@ -36,6 +36,14 @@ def render_plan(result, parcel_xy, access_pt):
         c = g.centroid
         ax.text(c.x, c.y, f"{name}\n{log} lgt", ha="center", va="center",
                 color="white", fontsize=7, fontweight="bold", zorder=6)
+    # cheminements pietons (serpentent du parking vers chaque coursive)
+    for line in r.get("cheminements", []):
+        xs, ys = line.xy
+        ax.plot(xs, ys, color="#16a085", lw=2.2, ls=(0, (4, 2)), zorder=6.5, alpha=0.9)
+    # coursive centrale de chaque batiment
+    for corr in r.get("corridors", []):
+        xs, ys = corr.xy
+        ax.plot(xs, ys, color="#ffffff", lw=1.4, ls=":", zorder=6.6, alpha=0.9)
     # accas
     if access_pt is not None:
         ax.plot(access_pt[0], access_pt[1], "v", color="#e67e22", ms=13, zorder=7)

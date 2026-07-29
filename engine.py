@@ -17,6 +17,7 @@ import math
 from shapely.geometry import Polygon, box, Point
 from shapely.affinity import rotate, translate
 from shapely.ops import unary_union
+from paths import find_paths
 
 # ------------------------------------------------------------------
 # 1. CATALOGUE (la donnee, depuis ta spec)
@@ -122,51 +123,59 @@ def place_buildings(buildable, enabled, dist_inter, angle_deg):
 # 4. POCHE DE STATIONNEMENT (v1 : baie double, pres de l'acces)
 # ------------------------------------------------------------------
 def parking_pocket(zone, access_pt, n_log, angle_deg):
-    """Baie de stationnement double : une rangee de garages + une rangee de
-    places, de part et d'autre d'une allee centrale, ancree pres de l'acces
-    et strictement a l'interieur de la zone constructible."""
+    """Baie de stationnement en PAIRES equilibrees : chaque colonne = 1 garage
+    (rangee basse) + 1 place (rangee haute) de part et d'autre d'une allee
+    centrale. On ne garde une colonne que si le garage ET la place tiennent
+    entierement dans la zone -> il y a toujours autant de garages que de places.
+    On garde les n_log colonnes les plus proches de l'acces. S'il en manque,
+    c'est signale honnetement (pas de sur-affichage)."""
     if n_log <= 0 or zone is None:
         return None, []
 
-    depth = GARAGE["d"] + ALLEE + PLACE["d"]      # profondeur totale de la baie
-    width = n_log * GARAGE["w"]                    # largeur (n_log emplacements / rangee)
+    gd, pd = GARAGE["d"], PLACE["d"]
+    depth = gd + ALLEE + pd
+    col_w = max(GARAGE["w"], PLACE["w"])
 
     cx, cy = zone.centroid.x, zone.centroid.y
-    # baie construite a plat, centree horizontalement sur l'acces, poussee
-    # vers l'interieur de la zone
-    ax = rotate(Point(access_pt), -angle_deg, origin=(cx, cy))
     zone_rot = rotate(zone, -angle_deg, origin=(cx, cy))
+    ax = rotate(Point(access_pt), -angle_deg, origin=(cx, cy))
     zminx, zminy, zmaxx, zmaxy = zone_rot.bounds
 
-    x0 = ax.x - width / 2
-    x0 = max(zminx, min(x0, zmaxx - width))        # garde la baie dans les bornes
-    # essaie de coller la baie au bord le plus proche de l'acces (haut ou bas)
+    # la baie s'appuie sur le bord (haut ou bas) le plus proche de l'acces
     if abs(ax.y - zminy) <= abs(ax.y - zmaxy):
         y0 = zminy
     else:
         y0 = zmaxy - depth
 
-    bay = box(x0, y0, x0 + width, y0 + depth)
-    bay = bay.intersection(zone_rot)               # clip strict dans la zone
-    if bay.is_empty or bay.area < 1:
+    # colonnes candidates sur toute la largeur ; on garde celles ou garage ET
+    # place tiennent dans la zone
+    cols = []
+    x = zminx
+    while x + col_w <= zmaxx + 1e-6:
+        gar = box(x, y0, x + GARAGE["w"], y0 + gd)
+        pl = box(x, y0 + depth - pd, x + PLACE["w"], y0 + depth)
+        if zone_rot.contains(gar.buffer(-1e-6)) and zone_rot.contains(pl.buffer(-1e-6)):
+            cols.append((x, gar, pl))
+        x += col_w
+
+    if not cols:
         return None, []
 
-    # dessine les emplacements (visuel + comptage) dans le repere a plat
+    # garde les n_log colonnes les plus proches de l'acces
+    cols.sort(key=lambda c: abs((c[0] + col_w / 2) - ax.x))
+    cols = cols[:n_log]
+    cols.sort(key=lambda c: c[0])
+
+    xs0 = min(c[0] for c in cols)
+    xs1 = max(c[0] for c in cols) + col_w
+    bay = box(xs0, y0, xs1, y0 + depth).intersection(zone_rot)
+
     stalls = []
-    xg = x0
-    for _ in range(n_log):                          # rangee garages (bas)
-        stalls.append(("garage", box(xg, y0, xg + GARAGE["w"], y0 + GARAGE["d"])))
-        xg += GARAGE["w"]
-    xp = x0
-    yp = y0 + depth - PLACE["d"]
-    for _ in range(n_log):                          # rangee places (haut)
-        stalls.append(("place", box(xp, yp, xp + PLACE["w"], yp + PLACE["d"])))
-        xp += PLACE["w"]
+    for _, gar, pl in cols:
+        stalls.append(("garage", gar))
+        stalls.append(("place", pl))
 
-    # ne garde que les emplacements reellement dans la zone
-    stalls = [(k, s) for k, s in stalls if zone_rot.contains(s.buffer(-1e-6))]
-
-    # repivote
+    # repivote vers le repere reel
     bay = rotate(bay, angle_deg, origin=(cx, cy))
     stalls = [(k, rotate(s, angle_deg, origin=(cx, cy))) for k, s in stalls]
     return bay, stalls
@@ -184,7 +193,7 @@ def compute_feasibility(parcel_xy, access_pt, params):
     angle = dominant_angle_deg(parcel)
 
     result = {"parcel": parcel, "zone": zone, "buildings": [], "parking": None,
-              "stalls": [], "angle": angle, "message": None}
+              "stalls": [], "corridors": [], "cheminements": [], "angle": angle, "message": None}
 
     if zone is None or zone.area < 1:
         result["message"] = "Terrain trop petit ou retraits trop forts (zone constructible vide)."
@@ -218,24 +227,29 @@ def compute_feasibility(parcel_xy, access_pt, params):
             L_star = Lt
             break
 
-    # implante pour L_star, puis dimensionne la poche au nombre reellement bati
+    # implante les batiments pour le point d'equilibre trouve
     area, _ = buildable_for(L_star)
     buildings = place_buildings(area, p["enabled"], p["dist_inter"], angle)
-    L_real = sum(b[2] for b in buildings)
-    bay, stalls = parking_pocket(zone, access_pt, L_real, angle)
-    if bay is not None:                  # la poche finale ne doit pas mordre un batiment
+    L_final = sum(b[2] for b in buildings)
+
+    # poche equilibree dimensionnee au nombre de logements ; retire un batiment
+    # seulement s'il chevauche reellement la poche
+    bay, stalls = parking_pocket(zone, access_pt, L_final, angle)
+    if bay is not None:
         keepout = bay.buffer(p["dist_inter"])
         buildings = [b for b in buildings if not b[1].intersects(keepout)]
-
-    # redimensionne la poche au nombre final de logements (regle stricte 1:1:1)
-    L_final = sum(b[2] for b in buildings)
-    if L_final > 0:
+        L_final = sum(b[2] for b in buildings)
         bay, stalls = parking_pocket(zone, access_pt, L_final, angle)
 
     if not buildings:
         result["message"] = "Terrain trop petit ou contraintes trop fortes (aucun batiment plaçable)."
 
-    result.update(buildings=buildings, parking=bay, stalls=stalls)
+    corridors, cheminements = ([], [])
+    if buildings and bay is not None:
+        corridors, cheminements = find_paths(zone, buildings, bay)
+
+    result.update(buildings=buildings, parking=bay, stalls=stalls,
+                  corridors=corridors, cheminements=cheminements)
     result["kpis"] = _kpis(result)
     return result
 
@@ -247,6 +261,7 @@ def _kpis(r):
     n_gar = sum(1 for k, _ in r["stalls"] if k == "garage")
     n_pl = sum(1 for k, _ in r["stalls"] if k == "place")
     surf_voirie = r["parking"].area if r["parking"] else 0.0
+    stationne = min(n_gar, n_pl)                 # logements reellement stationnes
     return {
         "surface_parcelle_m2": round(surf_parcelle, 1),
         "surface_batie_m2": round(surf_bati, 1),
@@ -255,4 +270,6 @@ def _kpis(r):
         "nb_logements": n_log,
         "nb_places": n_pl,
         "nb_garages": n_gar,
+        "stationnement_suffisant": stationne >= n_log,
+        "logements_non_stationnes": max(0, n_log - stationne),
     }
