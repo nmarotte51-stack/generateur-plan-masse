@@ -84,7 +84,7 @@ def _fits(cand, buildable, placed, dist_inter):
     return True
 
 
-def place_buildings(buildable, enabled, dist_inter, angle_deg):
+def place_buildings(buildable, enabled, dist_inter, angle_deg, step=1.5):
     """Range les batiments en rangees paralleles a l'orientation dominante.
     On travaille dans un repere pivote (terrain 'a plat'), on remplit en
     grille, puis on repivote. Resultat : implantation alignee et lisible."""
@@ -99,7 +99,6 @@ def place_buildings(buildable, enabled, dist_inter, angle_deg):
     types = sorted(enabled, key=lambda t: BUILDINGS[t]["log"] / (BUILDINGS[t]["w"] * BUILDINGS[t]["h"]), reverse=True)
 
     placed = []  # (name, polygon_rot, log)
-    step = 1.0
     for name in types:
         b = BUILDINGS[name]
         for (w, h) in [(b["w"], b["h"]), (b["h"], b["w"])]:
@@ -113,7 +112,7 @@ def place_buildings(buildable, enabled, dist_inter, angle_deg):
                         x += w + dist_inter
                     else:
                         x += step
-                y += h + dist_inter
+                y += step               # balayage fin : trouve toute bande libre
 
     # repivote vers le repere reel
     return [(name, rotate(g, angle_deg, origin=(cx, cy)), log) for name, g, log in placed]
@@ -123,12 +122,11 @@ def place_buildings(buildable, enabled, dist_inter, angle_deg):
 # 4. POCHE DE STATIONNEMENT (v1 : baie double, pres de l'acces)
 # ------------------------------------------------------------------
 def parking_pocket(zone, access_pt, n_log, angle_deg):
-    """Baie de stationnement en PAIRES equilibrees : chaque colonne = 1 garage
-    (rangee basse) + 1 place (rangee haute) de part et d'autre d'une allee
-    centrale. On ne garde une colonne que si le garage ET la place tiennent
-    entierement dans la zone -> il y a toujours autant de garages que de places.
-    On garde les n_log colonnes les plus proches de l'acces. S'il en manque,
-    c'est signale honnetement (pas de sur-affichage)."""
+    """Poche de stationnement compacte : on empile plusieurs baies doubles
+    (garages + allee + places) EN PROFONDEUR depuis le bord de l'acces, jusqu'a
+    garer les n_log logements. Chaque colonne (1 garage + 1 place) n'est retenue
+    que si les deux tiennent dans la zone -> paires toujours equilibrees, et la
+    poche remplit la surface pres de l'acces au lieu d'une seule rangee lineaire."""
     if n_log <= 0 or zone is None:
         return None, []
 
@@ -141,41 +139,41 @@ def parking_pocket(zone, access_pt, n_log, angle_deg):
     ax = rotate(Point(access_pt), -angle_deg, origin=(cx, cy))
     zminx, zminy, zmaxx, zmaxy = zone_rot.bounds
 
-    # la baie s'appuie sur le bord (haut ou bas) le plus proche de l'acces
+    # bord de depart (cote acces) et sens de progression vers l'interieur
     if abs(ax.y - zminy) <= abs(ax.y - zmaxy):
-        y0 = zminy
+        y, direction = zminy, +1.0
     else:
-        y0 = zmaxy - depth
+        y, direction = zmaxy - depth, -1.0
 
-    # colonnes candidates sur toute la largeur ; on garde celles ou garage ET
-    # place tiennent dans la zone
-    cols = []
-    x = zminx
-    while x + col_w <= zmaxx + 1e-6:
-        gar = box(x, y0, x + GARAGE["w"], y0 + gd)
-        pl = box(x, y0 + depth - pd, x + PLACE["w"], y0 + depth)
-        if zone_rot.contains(gar.buffer(-1e-6)) and zone_rot.contains(pl.buffer(-1e-6)):
-            cols.append((x, gar, pl))
-        x += col_w
+    stalls, bay_rects, placed, bays = [], [], 0, 0
+    while placed < n_log and bays < 8:
+        bays += 1
+        if y < zminy - 1e-6 or y + depth > zmaxy + 1e-6:
+            break
+        # colonnes de cette baie ou garage ET place tiennent dans la zone
+        cols, x = [], zminx
+        while x + col_w <= zmaxx + 1e-6:
+            gar = box(x, y, x + GARAGE["w"], y + gd)
+            pl = box(x, y + depth - pd, x + PLACE["w"], y + depth)
+            if zone_rot.contains(gar.buffer(-1e-6)) and zone_rot.contains(pl.buffer(-1e-6)):
+                cols.append((x, gar, pl))
+            x += col_w
+        if cols:
+            need = n_log - placed
+            cols.sort(key=lambda c: abs((c[0] + col_w / 2) - ax.x))  # proches de l'acces
+            take = sorted(cols[:need], key=lambda c: c[0])
+            for _, g, pcell in take:
+                stalls += [("garage", g), ("place", pcell)]
+                placed += 1
+            xs0 = min(c[0] for c in take)
+            xs1 = max(c[0] for c in take) + col_w
+            bay_rects.append(box(xs0, y, xs1, y + depth))
+        y += depth * direction                      # baie suivante, plus au fond
 
-    if not cols:
+    if not stalls:
         return None, []
 
-    # garde les n_log colonnes les plus proches de l'acces
-    cols.sort(key=lambda c: abs((c[0] + col_w / 2) - ax.x))
-    cols = cols[:n_log]
-    cols.sort(key=lambda c: c[0])
-
-    xs0 = min(c[0] for c in cols)
-    xs1 = max(c[0] for c in cols) + col_w
-    bay = box(xs0, y0, xs1, y0 + depth).intersection(zone_rot)
-
-    stalls = []
-    for _, gar, pl in cols:
-        stalls.append(("garage", gar))
-        stalls.append(("place", pl))
-
-    # repivote vers le repere reel
+    bay = unary_union(bay_rects).intersection(zone_rot)
     bay = rotate(bay, angle_deg, origin=(cx, cy))
     stalls = [(k, rotate(s, angle_deg, origin=(cx, cy))) for k, s in stalls]
     return bay, stalls
@@ -215,31 +213,40 @@ def compute_feasibility(parcel_xy, access_pt, params):
         area = _largest(zone.difference(bay.buffer(p["dist_inter"])))
         return (area or zone), bay
 
-    def capacity(Ltarget):
+    def capacity(Ltarget, step):
         area, _ = buildable_for(Ltarget)
-        b = place_buildings(area, p["enabled"], p["dist_inter"], angle)
+        b = place_buildings(area, p["enabled"], p["dist_inter"], angle, step=step)
         return sum(x[2] for x in b)
 
-    L0 = capacity(0)                     # potentiel brut sans parking
-    L_star = 0
-    for Lt in range(L0, -1, -1):         # du max vers le bas
-        if capacity(Lt) >= Lt:
-            L_star = Lt
+    # Recherche dichotomique du plus grand L tel que capacity(L) >= L.
+    # Estimation avec un pas grossier (rapide) pendant la recherche.
+    L0 = capacity(0, step=2.5)
+    lo, hi, L_star = 0, L0, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if capacity(mid, step=2.5) >= mid:
+            L_star, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+
+    # Point fixe : on veut un L tel qu'en reservant la poche pour L logements,
+    # le placement fin en produise exactement L. Les batiments evitent alors la
+    # poche par construction (buildable_for soustrait deja la poche) -> aucun
+    # chevauchement, aucun redimensionnement destructeur.
+    L, buildings = L_star, []
+    for _ in range(6):
+        area, _ = buildable_for(L)
+        buildings = place_buildings(area, p["enabled"], p["dist_inter"], angle, step=1.0)
+        Lf = sum(b[2] for b in buildings)
+        if Lf == L:
             break
-
-    # implante les batiments pour le point d'equilibre trouve
-    area, _ = buildable_for(L_star)
-    buildings = place_buildings(area, p["enabled"], p["dist_inter"], angle)
+        L = Lf
     L_final = sum(b[2] for b in buildings)
-
-    # poche equilibree dimensionnee au nombre de logements ; retire un batiment
-    # seulement s'il chevauche reellement la poche
     bay, stalls = parking_pocket(zone, access_pt, L_final, angle)
-    if bay is not None:
-        keepout = bay.buffer(p["dist_inter"])
-        buildings = [b for b in buildings if not b[1].intersects(keepout)]
-        L_final = sum(b[2] for b in buildings)
-        bay, stalls = parking_pocket(zone, access_pt, L_final, angle)
+    # securite : si (non convergence) la poche mord un batiment, on revient a
+    # la poche reservee pour L
+    if bay is not None and any(b[1].intersects(bay.buffer(p["dist_inter"])) for b in buildings):
+        bay, stalls = parking_pocket(zone, access_pt, L, angle)
 
     if not buildings:
         result["message"] = "Terrain trop petit ou contraintes trop fortes (aucun batiment plaçable)."

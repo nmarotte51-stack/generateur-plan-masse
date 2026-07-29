@@ -90,16 +90,15 @@ def find_paths(zone, buildings, bay, step=1.5):
     start = nearest_cell(alley)
 
     paths = []
-    for corr in corridors:
-        # entree = extremite de la coursive la plus proche de l'allee
-        ends = list(corr.coords)
-        entry = min(ends, key=lambda e: math.dist(e, alley))
-        goal = nearest_cell(entry)
+    for b, corr in zip(buildings, corridors):
+        # porte = point du contour du batiment le plus proche de l'allee
+        door = b[1].exterior.interpolate(b[1].exterior.project(Point(alley))).coords[0]
+        goal = nearest_cell(door)
         if start is None or goal is None:
             continue
         cells = _astar(walkable, ncols, nrows, start, goal)
         if cells:
-            pts = [alley] + [cell_xy(i, j) for i, j in cells] + [entry]
-            line = LineString(pts).simplify(step * 0.6)  # lisse un peu
+            pts = [alley] + [cell_xy(i, j) for i, j in cells] + [door]
+            line = LineString(pts).simplify(step * 0.3)   # lisse legerement
             paths.append(line)
     return corridors, paths

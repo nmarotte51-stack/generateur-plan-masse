@@ -24,9 +24,13 @@ def render_plan(result, parcel_xy, access_pt):
     if r["zone"] is not None:
         ax.add_patch(MplPoly(_xy(r["zone"]), fill=True, fc="#2980b920",
                              ec="#2980b9", lw=1.5, ls="--", zorder=1))
-    # poche de stationnement
+    # poche de stationnement (peut etre en plusieurs baies)
     if r["parking"] is not None:
-        ax.add_patch(MplPoly(_xy(r["parking"]), fc="#95a5a655", ec="#555", lw=1, zorder=3))
+        pk = r["parking"]
+        geoms = pk.geoms if pk.geom_type == "MultiPolygon" else [pk]
+        for gp in geoms:
+            if not gp.is_empty:
+                ax.add_patch(MplPoly(_xy(gp), fc="#95a5a655", ec="#555", lw=1, zorder=3))
     for kind, s in r["stalls"]:
         c = "#34495e" if kind == "garage" else "#bdc3c7"
         ax.add_patch(MplPoly(_xy(s), fc=c, ec="white", lw=0.6, zorder=4))
