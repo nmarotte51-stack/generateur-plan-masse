@@ -121,12 +121,14 @@ def place_buildings(buildable, enabled, dist_inter, angle_deg, step=1.5):
 # ------------------------------------------------------------------
 # 4. POCHE DE STATIONNEMENT (v1 : baie double, pres de l'acces)
 # ------------------------------------------------------------------
-def parking_pocket(zone, access_pt, n_log, angle_deg):
-    """Poche de stationnement compacte : on empile plusieurs baies doubles
-    (garages + allee + places) EN PROFONDEUR depuis le bord de l'acces, jusqu'a
-    garer les n_log logements. Chaque colonne (1 garage + 1 place) n'est retenue
-    que si les deux tiennent dans la zone -> paires toujours equilibrees, et la
-    poche remplit la surface pres de l'acces au lieu d'une seule rangee lineaire."""
+def parking_pocket(zone, parcel, access_pt, n_log, angle_deg):
+    """Poche de stationnement compacte, empilee en profondeur depuis le bord
+    de l'acces. Regle metier : les PLACES (parking ouvert) peuvent empieter sur
+    le retrait separatif -> elles sont contraintes par la PARCELLE ; les GARAGES
+    doivent rester hors retrait -> contraints par la ZONE constructible.
+    On dispose donc la rangee de places cote rue (peut mordre le retrait) et la
+    rangee de garages plus au fond (dans la zone). Colonnes toujours equilibrees
+    (1 garage + 1 place)."""
     if n_log <= 0 or zone is None:
         return None, []
 
@@ -134,28 +136,34 @@ def parking_pocket(zone, access_pt, n_log, angle_deg):
     depth = gd + ALLEE + pd
     col_w = max(GARAGE["w"], PLACE["w"])
 
-    cx, cy = zone.centroid.x, zone.centroid.y
+    cx, cy = parcel.centroid.x, parcel.centroid.y
     zone_rot = rotate(zone, -angle_deg, origin=(cx, cy))
+    parcel_rot = rotate(parcel, -angle_deg, origin=(cx, cy))
     ax = rotate(Point(access_pt), -angle_deg, origin=(cx, cy))
-    zminx, zminy, zmaxx, zmaxy = zone_rot.bounds
+    pminx, pminy, pmaxx, pmaxy = parcel_rot.bounds
 
-    # bord de depart (cote acces) et sens de progression vers l'interieur
-    if abs(ax.y - zminy) <= abs(ax.y - zmaxy):
-        y, direction = zminy, +1.0
+    # cote acces (bord de parcelle) et sens de progression vers l'interieur
+    if abs(ax.y - pminy) <= abs(ax.y - pmaxy):
+        y0, direction = pminy, +1.0        # rue en bas : places en bas, garages au-dessus
     else:
-        y, direction = zmaxy - depth, -1.0
+        y0, direction = pmaxy - depth, -1.0
 
     stalls, bay_rects, placed, bays = [], [], 0, 0
     while placed < n_log and bays < 8:
         bays += 1
-        if y < zminy - 1e-6 or y + depth > zmaxy + 1e-6:
+        if y0 < pminy - 1e-6 or y0 + depth > pmaxy + 1e-6:
             break
-        # colonnes de cette baie ou garage ET place tiennent dans la zone
-        cols, x = [], zminx
-        while x + col_w <= zmaxx + 1e-6:
-            gar = box(x, y, x + GARAGE["w"], y + gd)
-            pl = box(x, y + depth - pd, x + PLACE["w"], y + depth)
-            if zone_rot.contains(gar.buffer(-1e-6)) and zone_rot.contains(pl.buffer(-1e-6)):
+        # rangee places cote bord, rangee garages cote interieur
+        if direction > 0:
+            place_y, garage_y = y0, y0 + pd + ALLEE
+        else:
+            place_y, garage_y = y0 + depth - pd, y0
+        cols, x = [], pminx
+        while x + col_w <= pmaxx + 1e-6:
+            pl = box(x, place_y, x + PLACE["w"], place_y + pd)
+            gar = box(x, garage_y, x + GARAGE["w"], garage_y + gd)
+            # place : dans la parcelle (retrait autorise) ; garage : dans la zone
+            if parcel_rot.contains(pl.buffer(-1e-6)) and zone_rot.contains(gar.buffer(-1e-6)):
                 cols.append((x, gar, pl))
             x += col_w
         if cols:
@@ -167,13 +175,13 @@ def parking_pocket(zone, access_pt, n_log, angle_deg):
                 placed += 1
             xs0 = min(c[0] for c in take)
             xs1 = max(c[0] for c in take) + col_w
-            bay_rects.append(box(xs0, y, xs1, y + depth))
-        y += depth * direction                      # baie suivante, plus au fond
+            bay_rects.append(box(xs0, y0, xs1, y0 + depth))
+        y0 += depth * direction
 
     if not stalls:
         return None, []
 
-    bay = unary_union(bay_rects).intersection(zone_rot)
+    bay = unary_union(bay_rects).intersection(parcel_rot)   # clip a la parcelle
     bay = rotate(bay, angle_deg, origin=(cx, cy))
     stalls = [(k, rotate(s, angle_deg, origin=(cx, cy))) for k, s in stalls]
     return bay, stalls
@@ -207,7 +215,7 @@ def compute_feasibility(parcel_xy, access_pt, params):
     # On cherche le plus grand L tel que, en reservant le parking pour L,
     # on peut encore batir au moins L logements.
     def buildable_for(Ltarget):
-        bay, _ = parking_pocket(zone, access_pt, Ltarget, angle)
+        bay, _ = parking_pocket(zone, parcel, access_pt, Ltarget, angle)
         if bay is None:
             return zone, None
         area = _largest(zone.difference(bay.buffer(p["dist_inter"])))
@@ -242,18 +250,18 @@ def compute_feasibility(parcel_xy, access_pt, params):
             break
         L = Lf
     L_final = sum(b[2] for b in buildings)
-    bay, stalls = parking_pocket(zone, access_pt, L_final, angle)
+    bay, stalls = parking_pocket(zone, parcel, access_pt, L_final, angle)
     # securite : si (non convergence) la poche mord un batiment, on revient a
     # la poche reservee pour L
     if bay is not None and any(b[1].intersects(bay.buffer(p["dist_inter"])) for b in buildings):
-        bay, stalls = parking_pocket(zone, access_pt, L, angle)
+        bay, stalls = parking_pocket(zone, parcel, access_pt, L, angle)
 
     if not buildings:
         result["message"] = "Terrain trop petit ou contraintes trop fortes (aucun batiment plaçable)."
 
     corridors, cheminements = ([], [])
     if buildings and bay is not None:
-        corridors, cheminements = find_paths(zone, buildings, bay)
+        corridors, cheminements = find_paths(zone, buildings, bay, stalls)
 
     result.update(buildings=buildings, parking=bay, stalls=stalls,
                   corridors=corridors, cheminements=cheminements)

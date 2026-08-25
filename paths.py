@@ -52,19 +52,27 @@ def _astar(walkable, ncols, nrows, start, goal):
     return None
 
 
-def find_paths(zone, buildings, bay, step=1.5):
+def find_paths(zone, buildings, bay, stalls=None, step=1.5):
     """Rend (corridors, chemins) :
        - corridors : la coursive centrale de chaque batiment (LineString)
-       - chemins   : la poly-ligne serpentant du parking a chaque coursive."""
+       - chemins   : la poly-ligne serpentant du parking a chaque coursive,
+                     qui evite les batiments ET les emplacements (garages/places)
+                     mais peut circuler dans l'allee et entre les blocs."""
     corridors = [central_axis(b[1]) for b in buildings]
     if bay is None or not buildings:
         return corridors, []
 
-    # grille sur l'emprise de la zone
-    minx, miny, maxx, maxy = zone.bounds
+    stalls = stalls or []
+    # la circulation pietonne peut se trouver dans la zone OU dans la poche
+    # (les places peuvent etre dans le retrait, donc hors zone)
+    free = zone.union(bay)
+    minx, miny, maxx, maxy = free.bounds
     ncols = max(2, int((maxx - minx) / step) + 1)
     nrows = max(2, int((maxy - miny) / step) + 1)
-    obstacles = unary_union([b[1].buffer(0.6) for b in buildings])  # contourne les batiments
+
+    obs = [b[1].buffer(0.5) for b in buildings]                 # batiments
+    obs += [s.buffer(0.05) for _, s in stalls]                  # emplacements
+    obstacles = unary_union(obs) if obs else None
 
     def cell_xy(i, j):
         return (minx + i * step, miny + j * step)
@@ -72,26 +80,30 @@ def find_paths(zone, buildings, bay, step=1.5):
     walkable = [[False] * nrows for _ in range(ncols)]
     for i in range(ncols):
         for j in range(nrows):
-            p = Point(cell_xy(i, j))
-            walkable[i][j] = zone.contains(p) and not obstacles.contains(p)
+            pt = Point(cell_xy(i, j))
+            walkable[i][j] = free.contains(pt) and not (obstacles and obstacles.contains(pt))
 
-    def nearest_cell(pt, allow_obstacle=False):
+    def nearest_cell(pt):
         best, bd = None, 1e18
         for i in range(ncols):
             for j in range(nrows):
-                if not allow_obstacle and not walkable[i][j]:
-                    continue
-                d = math.dist(cell_xy(i, j), pt)
-                if d < bd:
-                    bd, best = d, (i, j)
+                if walkable[i][j]:
+                    dd = math.dist(cell_xy(i, j), pt)
+                    if dd < bd:
+                        bd, best = dd, (i, j)
         return best
 
-    alley = bay.centroid.coords[0]
+    # depart depuis l'allee (poche moins les emplacements), pas depuis une place
+    if stalls:
+        alley_region = bay.difference(unary_union([s for _, s in stalls]).buffer(0.05))
+    else:
+        alley_region = bay
+    alley = (alley_region.representative_point().coords[0]
+             if not alley_region.is_empty else bay.centroid.coords[0])
     start = nearest_cell(alley)
 
     paths = []
     for b, corr in zip(buildings, corridors):
-        # porte = point du contour du batiment le plus proche de l'allee
         door = b[1].exterior.interpolate(b[1].exterior.project(Point(alley))).coords[0]
         goal = nearest_cell(door)
         if start is None or goal is None:
@@ -99,6 +111,5 @@ def find_paths(zone, buildings, bay, step=1.5):
         cells = _astar(walkable, ncols, nrows, start, goal)
         if cells:
             pts = [alley] + [cell_xy(i, j) for i, j in cells] + [door]
-            line = LineString(pts).simplify(step * 0.3)   # lisse legerement
-            paths.append(line)
+            paths.append(LineString(pts).simplify(step * 0.3))
     return corridors, paths

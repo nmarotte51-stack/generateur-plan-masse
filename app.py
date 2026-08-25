@@ -28,7 +28,8 @@ PRESETS = {
 DW = 700  # largeur d'affichage du plan a dessiner (pixels)
 
 for k, v in {"parcel_df": pd.DataFrame(PRESETS["Terrain en L (concave)"], columns=["x", "y"]),
-             "draw_points": [], "last_click": None, "ax": 30.0, "ay": 0.0}.items():
+             "draw_points": [], "access_px": None, "calib_pts": [],
+             "last_click": None, "ax": 30.0, "ay": 0.0}.items():
     st.session_state.setdefault(k, v)
 
 # ------------------------------------------------------------------
@@ -43,66 +44,100 @@ parcel_xy, access_pt = None, None
 # ==================================================================
 if mode == "Dessiner sur un plan":
     st.title("Generateur de faisabilite - Carre de l'Habitat")
-    st.subheader("1. Dessiner la parcelle sur votre plan")
+    st.subheader("1. Dessiner sur votre plan")
 
     up = st.file_uploader("Importer un plan de fond (cadastre) - PNG ou JPG",
                           type=["png", "jpg", "jpeg"])
-    largeur_reelle = st.number_input(
-        "Echelle : largeur reelle du plan affiche (metres)",
-        min_value=1.0, value=100.0, step=1.0,
-        help="Ex : si le plan importe represente 100 m de large sur le terrain, saisir 100.")
-
-    cbtn1, cbtn2, cbtn3 = st.columns(3)
-    if cbtn1.button("Annuler le dernier point") and st.session_state.draw_points:
-        st.session_state.draw_points.pop()
-    if cbtn2.button("Tout effacer"):
-        st.session_state.draw_points = []
-    ferme = cbtn3.checkbox("Fermer la parcelle", value=True,
-                           help="Relie le dernier point au premier.")
-
     if up is None:
-        st.info("Importez d'abord un plan, puis cliquez les sommets de la parcelle "
-                "dans l'ordre, en tournant autour du terrain.")
+        st.info("Importez un plan, puis : (1) calibrez l'echelle avec 2 points de "
+                "distance connue, (2) cliquez les sommets de la parcelle, (3) placez l'acces.")
         st.stop()
 
+    action = st.radio("Le clic sert a :",
+                      ["Sommet de la parcelle", "Placer l'acces voiture", "Point de calibrage"],
+                      horizontal=True)
+
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("Annuler dernier sommet") and st.session_state.draw_points:
+        st.session_state.draw_points.pop()
+    if b2.button("Effacer parcelle"):
+        st.session_state.draw_points = []
+    if b3.button("Effacer calibrage"):
+        st.session_state.calib_pts = []
+    ferme = b4.checkbox("Fermer la parcelle", value=True)
+
+    # --- echelle : calibrage par 2 points (ideal pour un plan 1:500) ---------
+    st.markdown("**Echelle** — placez 2 points de distance connue (ex. un cote de "
+                "parcelle cote, une barre d'echelle), puis saisissez la distance reelle.")
+    calib = st.session_state.calib_pts
+    dist_reelle = st.number_input("Distance reelle entre les 2 points de calibrage (metres)",
+                                  min_value=0.1, value=20.0, step=0.5)
     img = Image.open(up).convert("RGB")
     dh = int(img.height * DW / img.width)
     base = img.resize((DW, dh))
 
-    # dessine les points/segments deja poses par-dessus le plan
+    mpp = None
+    if len(calib) == 2:
+        pix = ((calib[0][0] - calib[1][0]) ** 2 + (calib[0][1] - calib[1][1]) ** 2) ** 0.5
+        if pix > 1:
+            mpp = dist_reelle / pix
+            st.success(f"Echelle calibree : 1 pixel = {mpp:.3f} m  "
+                       f"(le plan affiche fait {DW*mpp:.1f} m de large).")
+    if mpp is None:
+        st.warning("Echelle non calibree : placez 2 points de calibrage. "
+                   "En attendant, une echelle par defaut est utilisee.")
+        mpp = 20.0 / DW  # defaut neutre
+
+    # --- overlay : parcelle + acces + calibrage ------------------------------
     disp = base.copy()
     d = ImageDraw.Draw(disp)
     pts = st.session_state.draw_points
     if len(pts) >= 2:
-        seq = pts + ([pts[0]] if ferme and len(pts) >= 3 else [])
-        d.line(seq, fill=(230, 80, 30), width=3)
+        d.line(pts + ([pts[0]] if ferme and len(pts) >= 3 else []), fill=(230, 80, 30), width=3)
     for (px, py) in pts:
         d.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(230, 80, 30), outline="white")
+    if len(calib) >= 1:
+        if len(calib) == 2:
+            d.line(calib, fill=(20, 130, 200), width=3)
+        for (px, py) in calib:
+            d.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(20, 130, 200), outline="white")
+    if st.session_state.access_px is not None:
+        px, py = st.session_state.access_px
+        d.polygon([(px, py - 9), (px - 8, py + 7), (px + 8, py + 7)],
+                  fill=(230, 140, 0), outline="white")
 
-    st.caption("Cliquez pour ajouter un sommet. Tournez autour de la parcelle dans l'ordre.")
+    st.caption("Cliquez sur le plan selon l'action choisie ci-dessus.")
     val = streamlit_image_coordinates(disp, key="cadastre")
     if val is not None:
         click = (int(val["x"]), int(val["y"]))
-        if click != st.session_state.last_click:      # evite les doublons au rerun
+        if click != st.session_state.last_click:
             st.session_state.last_click = click
-            st.session_state.draw_points.append(click)
+            if action == "Sommet de la parcelle":
+                st.session_state.draw_points.append(click)
+            elif action == "Placer l'acces voiture":
+                st.session_state.access_px = click
+            else:
+                if len(st.session_state.calib_pts) >= 2:
+                    st.session_state.calib_pts = []
+                st.session_state.calib_pts.append(click)
             st.rerun()
 
     if len(pts) < 3:
-        st.info(f"{len(pts)} point(s) pose(s). Il en faut au moins 3.")
+        st.info(f"{len(pts)} sommet(s) pose(s). Il en faut au moins 3.")
         st.stop()
 
-    # conversion pixels -> metres (axe Y inverse : le haut de l'image = Y grand)
-    mpp = largeur_reelle / DW
-    parcel_xy = [(px * mpp, (dh - py) * mpp) for (px, py) in pts]
+    # conversion pixels -> metres (Y inverse : haut de l'image = Y grand)
+    to_m = lambda px, py: (px * mpp, (dh - py) * mpp)
+    parcel_xy = [to_m(px, py) for (px, py) in pts]
 
-    # choix du bord d'acces (rue)
-    st.subheader("2. Bord d'acces (rue)")
-    edge_labels = [f"Bord {i+1} (sommet {i+1} - {((i+1) % len(pts))+1})" for i in range(len(pts))]
-    ei = st.selectbox("Sur quel bord se trouve l'acces ?", range(len(pts)),
-                      format_func=lambda i: edge_labels[i])
-    a, b = parcel_xy[ei], parcel_xy[(ei + 1) % len(pts)]
-    access_pt = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    if st.session_state.access_px is not None:
+        access_pt = to_m(*st.session_state.access_px)
+        st.caption("Acces : place manuellement (repere orange).")
+    else:
+        a, b = parcel_xy[0], parcel_xy[1]
+        access_pt = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+        st.caption("Acces : non place -> milieu du 1er cote par defaut "
+                   "(choisis 'Placer l'acces voiture' et clique pour le definir).")
 
 # ==================================================================
 # MODE 2 : PRESETS / COORDONNEES
