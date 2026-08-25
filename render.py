@@ -31,6 +31,13 @@ def render_plan(result, parcel_xy, access_pt):
     if r["zone"] is not None:
         ax.add_patch(MplPoly(_xy(r["zone"]), fill=True, fc="#2980b920",
                              ec="#2980b9", lw=1.5, ls="--", zorder=1))
+    # voirie interne (tiree depuis l'acces)
+    if r.get("voirie") is not None:
+        vo = r["voirie"]
+        vgeoms = vo.geoms if vo.geom_type == "MultiPolygon" else [vo]
+        for gv in vgeoms:
+            if not gv.is_empty:
+                ax.add_patch(MplPoly(_xy(gv), fc="#d9cbb2", ec="#b8a888", lw=1, zorder=2.5))
     # poche de stationnement (peut etre en plusieurs baies)
     if r["parking"] is not None:
         pk = r["parking"]

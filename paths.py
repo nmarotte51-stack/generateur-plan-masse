@@ -42,6 +42,9 @@ def _astar(walkable, ncols, nrows, start, goal):
             ni, nj = cur[0] + di, cur[1] + dj
             if not (0 <= ni < ncols and 0 <= nj < nrows) or not walkable[ni][nj]:
                 continue
+            if di and dj:   # diagonale interdite si elle coupe un coin d'obstacle
+                if not (walkable[cur[0] + di][cur[1]] and walkable[cur[0]][cur[1] + dj]):
+                    continue
             step = 1.4142 if di and dj else 1.0
             ng = g + step
             nn = (ni, nj)
@@ -52,26 +55,24 @@ def _astar(walkable, ncols, nrows, start, goal):
     return None
 
 
-def find_paths(zone, buildings, bay, stalls=None, step=1.5):
-    """Rend (corridors, chemins) :
-       - corridors : la coursive centrale de chaque batiment (LineString)
-       - chemins   : la poly-ligne serpentant du parking a chaque coursive,
-                     qui evite les batiments ET les emplacements (garages/places)
-                     mais peut circuler dans l'allee et entre les blocs."""
+def find_paths(zone, buildings, bay, stalls=None, step=None):
+    """Rend (corridors, chemins) : coursive centrale de chaque batiment, et
+    poly-ligne serpentant du parking a chaque coursive, evitant batiments ET
+    emplacements (garages/places) mais circulant dans l'allee."""
     corridors = [central_axis(b[1]) for b in buildings]
     if bay is None or not buildings:
         return corridors, []
 
     stalls = stalls or []
-    # la circulation pietonne peut se trouver dans la zone OU dans la poche
-    # (les places peuvent etre dans le retrait, donc hors zone)
     free = zone.union(bay)
     minx, miny, maxx, maxy = free.bounds
+    if step is None:                       # grille adaptee a la taille du terrain
+        step = max(1.5, max(maxx - minx, maxy - miny) / 55.0)
     ncols = max(2, int((maxx - minx) / step) + 1)
     nrows = max(2, int((maxy - miny) / step) + 1)
 
-    obs = [b[1].buffer(0.5) for b in buildings]                 # batiments
-    obs += [s.buffer(0.05) for _, s in stalls]                  # emplacements
+    obs = [b[1].buffer(0.5) for b in buildings]
+    obs += [s.buffer(0.20) for _, s in stalls]     # marge nette autour des emplacements
     obstacles = unary_union(obs) if obs else None
 
     def cell_xy(i, j):
@@ -95,7 +96,7 @@ def find_paths(zone, buildings, bay, stalls=None, step=1.5):
 
     # depart depuis l'allee (poche moins les emplacements), pas depuis une place
     if stalls:
-        alley_region = bay.difference(unary_union([s for _, s in stalls]).buffer(0.05))
+        alley_region = bay.difference(unary_union([s for _, s in stalls]).buffer(0.20))
     else:
         alley_region = bay
     alley = (alley_region.representative_point().coords[0]

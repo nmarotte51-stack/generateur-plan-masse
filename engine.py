@@ -14,7 +14,7 @@ compact pour etre teste et corrige par petites touches.
 """
 
 import math
-from shapely.geometry import Polygon, box, Point
+from shapely.geometry import Polygon, box, Point, LineString
 from shapely.affinity import rotate, translate
 from shapely.ops import unary_union
 from paths import find_paths
@@ -23,10 +23,10 @@ from paths import find_paths
 # 1. CATALOGUE (la donnee, depuis ta spec)
 # ------------------------------------------------------------------
 BUILDINGS = {
-    "KAIA":  {"w": 14.20, "h": 15.80, "log": 4},
-    "NAIA5": {"w": 15.80, "h": 15.80, "log": 5},
-    "DAIA":  {"w":  8.10, "h": 14.20, "log": 2},
-    "TAIA":  {"w":  8.10, "h": 21.14, "log": 3},
+    "KAIA": {"w": 14.20, "h": 15.80, "log": 4},   # 4 T4
+    "NAIA": {"w": 15.80, "h": 15.80, "log": 4},   # 4 T4 (ref PLU : 4 lgt, pas 5)
+    "DAIA": {"w":  8.10, "h": 14.20, "log": 2},   # 2 T4
+    "TAIA": {"w":  8.10, "h": 21.14, "log": 3},   # 3 T4
 }
 PLACE  = {"w": 2.50, "d": 5.00}   # place standard
 GARAGE = {"w": 2.78, "d": 5.50}   # garage box
@@ -62,14 +62,34 @@ def dominant_angle_deg(poly):
     return best_ang
 
 
-def constructible_zone(parcel_xy, retrait_separatif):
-    """LE calcul critique : la zone constructible = parcelle retrecie du
-    retrait separatif. Buffer negatif robuste (join mitre)."""
+def _road_edge(parcel_xy, access_pt):
+    """Bord de parcelle (segment) le plus proche de l'acces = la rue."""
+    poly = Polygon(parcel_xy)
+    ap = Point(access_pt)
+    xy = list(poly.exterior.coords)
+    best, bd = None, 1e18
+    for i in range(len(xy) - 1):
+        seg = LineString([xy[i], xy[i + 1]])
+        dd = seg.distance(ap)
+        if dd < bd:
+            bd, best = dd, seg
+    return best
+
+
+def constructible_zone(parcel_xy, retrait_separatif, retrait_voie=None, access_pt=None):
+    """Zone constructible = parcelle retrecie du retrait separatif, avec un
+    retrait VOIRIE (souvent different) applique en plus le long du bord d'acces
+    (la rue). Buffer negatif robuste (Shapely gere concavites/auto-intersections)."""
     poly = Polygon(parcel_xy)
     if not poly.is_valid:
         poly = poly.buffer(0)          # repare les auto-intersections du trace
-    zc = poly.buffer(-retrait_separatif, join_style=2, mitre_limit=5.0)
-    return _largest(zc)
+    zc = _largest(poly.buffer(-retrait_separatif, join_style=2, mitre_limit=5.0))
+    if zc is None:
+        return None
+    if retrait_voie and access_pt is not None and retrait_voie > retrait_separatif:
+        strip = _road_edge(parcel_xy, access_pt).buffer(retrait_voie)
+        zc = _largest(zc.difference(strip))
+    return zc
 
 
 # ------------------------------------------------------------------
@@ -191,29 +211,29 @@ def parking_pocket(zone, parcel, access_pt, n_log, angle_deg):
 # 5. PIPELINE COMPLET + boucle d'ajustement bornee
 # ------------------------------------------------------------------
 def compute_feasibility(parcel_xy, access_pt, params):
-    p = {"retrait_sep": 3.0, "dist_inter": 4.0, "enabled": list(BUILDINGS.keys())}
+    p = {"retrait_sep": 3.0, "retrait_voie": 5.0, "dist_inter": 4.0,
+         "ces_max": 1.0, "espaces_verts_min": 0.0, "voirie_larg": 5.0,
+         "enabled": list(BUILDINGS.keys())}
     p.update(params or {})
 
     parcel = Polygon(parcel_xy)
-    zone = constructible_zone(parcel_xy, p["retrait_sep"])
     angle = dominant_angle_deg(parcel)
+    if access_pt is None:
+        access_pt = list(parcel.centroid.coords)[0]
+    zone = constructible_zone(parcel_xy, p["retrait_sep"], p["retrait_voie"], access_pt)
 
     result = {"parcel": parcel, "zone": zone, "buildings": [], "parking": None,
-              "stalls": [], "corridors": [], "cheminements": [], "angle": angle, "message": None}
+              "stalls": [], "corridors": [], "cheminements": [], "voirie": None,
+              "angle": angle, "params": p, "message": None}
 
     if zone is None or zone.area < 1:
         result["message"] = "Terrain trop petit ou retraits trop forts (zone constructible vide)."
         result["kpis"] = _kpis(result)
         return result
 
-    if access_pt is None:
-        access_pt = list(zone.centroid.coords)[0]
+    # plafond CES : emprise batie maxi = ces_max * surface parcelle
+    ces_cap_m2 = p["ces_max"] * parcel.area if p["ces_max"] < 1.0 else float("inf")
 
-    # --- Recherche du point d'equilibre batiments <-> parking -------------
-    # Contrainte stricte : 1 logement = 1 place + 1 garage. La poche grandit
-    # donc avec le nombre de logements, ce qui reduit la place pour batir.
-    # On cherche le plus grand L tel que, en reservant le parking pour L,
-    # on peut encore batir au moins L logements.
     def buildable_for(Ltarget):
         bay, _ = parking_pocket(zone, parcel, access_pt, Ltarget, angle)
         if bay is None:
@@ -221,13 +241,20 @@ def compute_feasibility(parcel_xy, access_pt, params):
         area = _largest(zone.difference(bay.buffer(p["dist_inter"])))
         return (area or zone), bay
 
+    def cap_ces(bldgs):
+        """Retire des batiments (plus petits d'abord) tant que l'emprise > CES."""
+        bldgs = sorted(bldgs, key=lambda b: -b[1].area)   # garde les gros d'abord
+        kept, surf = [], 0.0
+        for b in bldgs:
+            if surf + b[1].area <= ces_cap_m2 + 1e-6:
+                kept.append(b); surf += b[1].area
+        return kept
+
     def capacity(Ltarget, step):
         area, _ = buildable_for(Ltarget)
         b = place_buildings(area, p["enabled"], p["dist_inter"], angle, step=step)
-        return sum(x[2] for x in b)
+        return sum(x[2] for x in cap_ces(b))
 
-    # Recherche dichotomique du plus grand L tel que capacity(L) >= L.
-    # Estimation avec un pas grossier (rapide) pendant la recherche.
     L0 = capacity(0, step=2.5)
     lo, hi, L_star = 0, L0, 0
     while lo <= hi:
@@ -237,54 +264,70 @@ def compute_feasibility(parcel_xy, access_pt, params):
         else:
             hi = mid - 1
 
-    # Point fixe : on veut un L tel qu'en reservant la poche pour L logements,
-    # le placement fin en produise exactement L. Les batiments evitent alors la
-    # poche par construction (buildable_for soustrait deja la poche) -> aucun
-    # chevauchement, aucun redimensionnement destructeur.
     L, buildings = L_star, []
     for _ in range(6):
         area, _ = buildable_for(L)
-        buildings = place_buildings(area, p["enabled"], p["dist_inter"], angle, step=1.0)
+        buildings = cap_ces(place_buildings(area, p["enabled"], p["dist_inter"], angle, step=1.0))
         Lf = sum(b[2] for b in buildings)
         if Lf == L:
             break
         L = Lf
     L_final = sum(b[2] for b in buildings)
     bay, stalls = parking_pocket(zone, parcel, access_pt, L_final, angle)
-    # securite : si (non convergence) la poche mord un batiment, on revient a
-    # la poche reservee pour L
     if bay is not None and any(b[1].intersects(bay.buffer(p["dist_inter"])) for b in buildings):
         bay, stalls = parking_pocket(zone, parcel, access_pt, L, angle)
 
     if not buildings:
         result["message"] = "Terrain trop petit ou contraintes trop fortes (aucun batiment plaçable)."
 
+    # voirie : tiree depuis l'acces jusqu'a la poche de stationnement
+    voirie = None
+    if bay is not None:
+        target = bay.centroid
+        voirie = LineString([access_pt, (target.x, target.y)]).buffer(
+            p["voirie_larg"] / 2, cap_style=2).intersection(parcel)
+        if voirie.is_empty:
+            voirie = None
+
     corridors, cheminements = ([], [])
     if buildings and bay is not None:
         corridors, cheminements = find_paths(zone, buildings, bay, stalls)
 
-    result.update(buildings=buildings, parking=bay, stalls=stalls,
+    result.update(buildings=buildings, parking=bay, stalls=stalls, voirie=voirie,
                   corridors=corridors, cheminements=cheminements)
     result["kpis"] = _kpis(result)
     return result
 
 
 def _kpis(r):
+    p = r.get("params", {})
     surf_parcelle = r["parcel"].area
     surf_bati = sum(b[1].area for b in r["buildings"])
     n_log = sum(b[2] for b in r["buildings"])
     n_gar = sum(1 for k, _ in r["stalls"] if k == "garage")
     n_pl = sum(1 for k, _ in r["stalls"] if k == "place")
-    surf_voirie = r["parking"].area if r["parking"] else 0.0
-    stationne = min(n_gar, n_pl)                 # logements reellement stationnes
+    surf_poche = r["parking"].area if r["parking"] else 0.0
+    surf_voirie = r["voirie"].area if r.get("voirie") else 0.0
+    # emprises impermeables = bati + poche + voirie ; le reste = espaces verts/libres
+    surf_verts = max(0.0, surf_parcelle - surf_bati - surf_poche - surf_voirie)
+    stationne = min(n_gar, n_pl)
+    emprise_pct = (surf_bati / surf_parcelle * 100) if surf_parcelle else 0
+    verts_pct = (surf_verts / surf_parcelle * 100) if surf_parcelle else 0
+    ces_max = p.get("ces_max", 1.0) * 100
+    ev_min = p.get("espaces_verts_min", 0.0) * 100
     return {
         "surface_parcelle_m2": round(surf_parcelle, 1),
         "surface_batie_m2": round(surf_bati, 1),
-        "surface_libre_m2": round(surf_parcelle - surf_bati - surf_voirie, 1),
-        "surface_poche_stationnement_m2": round(surf_voirie, 1),
+        "surface_espaces_verts_m2": round(surf_verts, 1),
+        "surface_poche_stationnement_m2": round(surf_poche, 1),
+        "surface_voirie_m2": round(surf_voirie, 1),
         "nb_logements": n_log,
         "nb_places": n_pl,
         "nb_garages": n_gar,
+        "emprise_au_sol_pct": round(emprise_pct, 1),
+        "espaces_verts_pct": round(verts_pct, 1),
+        "ces_respecte": emprise_pct <= ces_max + 0.1,
+        "espaces_verts_respecte": verts_pct >= ev_min - 0.1,
         "stationnement_suffisant": stationne >= n_log,
         "logements_non_stationnes": max(0, n_log - stationne),
     }

@@ -46,15 +46,18 @@ if mode == "Dessiner sur un plan":
     st.title("Generateur de faisabilite - Carre de l'Habitat")
     st.subheader("1. Dessiner sur votre plan")
 
-    up = st.file_uploader("Importer un plan de fond (cadastre) - PNG ou JPG",
-                          type=["png", "jpg", "jpeg"])
+    up = st.file_uploader("Importer votre plan - PDF (cadastre 1:500) ou PNG/JPG",
+                          type=["pdf", "png", "jpg", "jpeg"])
     if up is None:
-        st.info("Importez un plan, puis : (1) calibrez l'echelle avec 2 points de "
-                "distance connue, (2) cliquez les sommets de la parcelle, (3) placez l'acces.")
+        st.info("Importez votre plan. En PDF a l'echelle (ex. cadastre 1:500), la mise "
+                "a l'echelle est automatique. En image, calibrez avec 2 points de distance connue.")
         st.stop()
 
+    is_pdf = up.name.lower().endswith(".pdf")
+
     action = st.radio("Le clic sert a :",
-                      ["Sommet de la parcelle", "Placer l'acces voiture", "Point de calibrage"],
+                      ["Sommet de la parcelle", "Placer l'acces voiture"] +
+                      ([] if is_pdf else ["Point de calibrage"]),
                       horizontal=True)
 
     b1, b2, b3, b4 = st.columns(4)
@@ -66,27 +69,41 @@ if mode == "Dessiner sur un plan":
         st.session_state.calib_pts = []
     ferme = b4.checkbox("Fermer la parcelle", value=True)
 
-    # --- echelle : calibrage par 2 points (ideal pour un plan 1:500) ---------
-    st.markdown("**Echelle** — placez 2 points de distance connue (ex. un cote de "
-                "parcelle cote, une barre d'echelle), puis saisissez la distance reelle.")
-    calib = st.session_state.calib_pts
-    dist_reelle = st.number_input("Distance reelle entre les 2 points de calibrage (metres)",
-                                  min_value=0.1, value=20.0, step=0.5)
-    img = Image.open(up).convert("RGB")
-    dh = int(img.height * DW / img.width)
-    base = img.resize((DW, dh))
-
+    # --- image de fond + echelle --------------------------------------------
+    DPI = 150
     mpp = None
-    if len(calib) == 2:
-        pix = ((calib[0][0] - calib[1][0]) ** 2 + (calib[0][1] - calib[1][1]) ** 2) ** 0.5
-        if pix > 1:
-            mpp = dist_reelle / pix
-            st.success(f"Echelle calibree : 1 pixel = {mpp:.3f} m  "
-                       f"(le plan affiche fait {DW*mpp:.1f} m de large).")
-    if mpp is None:
-        st.warning("Echelle non calibree : placez 2 points de calibrage. "
-                   "En attendant, une echelle par defaut est utilisee.")
-        mpp = 20.0 / DW  # defaut neutre
+    if is_pdf:
+        import pymupdf
+        echelle = st.number_input("Echelle du plan PDF (1 : ?)", min_value=50, value=500, step=50,
+                                  help="Echelle d'origine du plan (cadastre = souvent 1:500).")
+        doc = pymupdf.open(stream=up.getvalue(), filetype="pdf")
+        page = doc[0]
+        pix = page.get_pixmap(dpi=DPI)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        # echelle AUTOMATIQUE et exacte : mpp_natif = echelle * 25.4mm/pouce / 1000 / DPI
+        mpp_natif = echelle * 0.0254 / DPI
+        dh = int(img.height * DW / img.width)
+        base = img.resize((DW, dh))
+        mpp = mpp_natif * (img.width / DW)         # corrige le redimensionnement d'affichage
+        st.success(f"Echelle PDF automatique (1:{echelle}) : le plan affiche fait "
+                   f"{DW*mpp:.0f} m de large. Aucun calibrage a faire.")
+    else:
+        img = Image.open(up).convert("RGB")
+        dh = int(img.height * DW / img.width)
+        base = img.resize((DW, dh))
+        st.markdown("**Echelle (image)** — placez 2 points de distance connue puis "
+                    "saisissez la distance reelle.")
+        calib = st.session_state.calib_pts
+        dist_reelle = st.number_input("Distance reelle entre les 2 points (metres)",
+                                      min_value=0.1, value=20.0, step=0.5)
+        if len(calib) == 2:
+            pixd = ((calib[0][0] - calib[1][0]) ** 2 + (calib[0][1] - calib[1][1]) ** 2) ** 0.5
+            if pixd > 1:
+                mpp = dist_reelle / pixd
+                st.success(f"Echelle calibree : le plan affiche fait {DW*mpp:.0f} m de large.")
+        if mpp is None:
+            st.warning("Echelle non calibree : placez 2 points de calibrage.")
+            mpp = 20.0 / DW
 
     # --- overlay : parcelle + acces + calibrage ------------------------------
     disp = base.copy()
@@ -96,6 +113,7 @@ if mode == "Dessiner sur un plan":
         d.line(pts + ([pts[0]] if ferme and len(pts) >= 3 else []), fill=(230, 80, 30), width=3)
     for (px, py) in pts:
         d.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(230, 80, 30), outline="white")
+    calib = st.session_state.calib_pts if not is_pdf else []
     if len(calib) >= 1:
         if len(calib) == 2:
             d.line(calib, fill=(20, 130, 200), width=3)
@@ -116,7 +134,7 @@ if mode == "Dessiner sur un plan":
                 st.session_state.draw_points.append(click)
             elif action == "Placer l'acces voiture":
                 st.session_state.access_px = click
-            else:
+            elif action == "Point de calibrage":
                 if len(st.session_state.calib_pts) >= 2:
                     st.session_state.calib_pts = []
                 st.session_state.calib_pts.append(click)
@@ -173,9 +191,16 @@ else:
 # ==================================================================
 # REGLES + BATIMENTS (communs aux deux modes)
 # ==================================================================
-st.sidebar.subheader("3. Regles d'urbanisme")
+st.sidebar.subheader("3. Regles PLU")
 retrait = st.sidebar.slider("Retrait limites separatives (m)", 0.0, 15.0, 4.0, 0.5)
+retrait_voie = st.sidebar.slider("Retrait voirie / alignement (m)", 0.0, 15.0, 5.0, 0.5,
+                                 help="Recul impose le long de la rue (souvent different du separatif).")
 dist_inter = st.sidebar.slider("Distance min entre batiments (m)", 0.0, 15.0, 5.0, 0.5)
+ces_max = st.sidebar.slider("Emprise au sol max - CES (%)", 5, 100, 100, 5,
+                            help="Coefficient d'emprise au sol maximal du PLU.") / 100.0
+ev_min = st.sidebar.slider("Espaces verts min (%)", 0, 80, 0, 5,
+                           help="Part minimale d'espaces libres / verts.") / 100.0
+voirie_larg = st.sidebar.slider("Largeur voirie interne (m)", 3.0, 8.0, 5.0, 0.5)
 
 st.sidebar.subheader("4. Batiments autorises")
 enabled = [n for n in BUILDINGS if st.sidebar.checkbox(
@@ -200,7 +225,10 @@ if access_pt is None:
     access_pt = list(Polygon(parcel_xy).centroid.coords)[0]
 
 result = compute_feasibility(parcel_xy, access_pt,
-                             {"retrait_sep": retrait, "dist_inter": dist_inter, "enabled": enabled})
+                             {"retrait_sep": retrait, "retrait_voie": retrait_voie,
+                              "dist_inter": dist_inter, "ces_max": ces_max,
+                              "espaces_verts_min": ev_min, "voirie_larg": voirie_larg,
+                              "enabled": enabled})
 k = result["kpis"]
 
 st.subheader("Resultat" if mode == "Dessiner sur un plan" else "")
@@ -212,17 +240,22 @@ with col_kpi:
         st.error(result["message"])
     if not k.get("stationnement_suffisant", True):
         st.warning(f"Stationnement insuffisant : {k['logements_non_stationnes']} "
-                   f"logement(s) non stationne(s). La forme du terrain limite les emplacements.")
+                   f"logement(s) non stationne(s).")
+    if not k.get("ces_respecte", True):
+        st.warning(f"CES depasse : emprise {k['emprise_au_sol_pct']} %.")
+    if not k.get("espaces_verts_respecte", True):
+        st.warning(f"Espaces verts insuffisants : {k['espaces_verts_pct']} %.")
     st.subheader("Indicateurs")
     a, b = st.columns(2)
     a.metric("Logements", k["nb_logements"])
     b.metric("Places / Garages", f'{k["nb_places"]} / {k["nb_garages"]}')
     a.metric("Surface parcelle", f'{k["surface_parcelle_m2"]:.0f} m2')
     b.metric("Surface batie", f'{k["surface_batie_m2"]:.0f} m2')
-    a.metric("Espace libre", f'{k["surface_libre_m2"]:.0f} m2')
-    b.metric("Poche stationnement", f'{k["surface_poche_stationnement_m2"]:.0f} m2')
-    emprise = (k["surface_batie_m2"] / k["surface_parcelle_m2"] * 100) if k["surface_parcelle_m2"] else 0
-    st.metric("Emprise au sol", f"{emprise:.1f} %")
+    a.metric("Emprise au sol", f'{k["emprise_au_sol_pct"]:.1f} %')
+    b.metric("Espaces verts", f'{k["espaces_verts_pct"]:.1f} %')
+    a.metric("Poche stationnement", f'{k["surface_poche_stationnement_m2"]:.0f} m2')
+    b.metric("Voirie interne", f'{k["surface_voirie_m2"]:.0f} m2')
 
-st.caption("Moteur v1 - zone constructible robuste, stationnement 1:1:1 verifie, "
-           "cheminements pietons vers la coursive de chaque batiment.")
+st.caption("Moteur v2 - zone constructible (retraits voie/separatif), CES & espaces verts, "
+           "poche stationnement collee a l'acces, voirie tiree de l'acces, "
+           "cheminements evitant les stationnements.")

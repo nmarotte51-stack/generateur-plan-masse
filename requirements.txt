@@ -4,3 +4,4 @@ shapely>=2.0
 matplotlib
 pandas
 Pillow
+pymupdf
