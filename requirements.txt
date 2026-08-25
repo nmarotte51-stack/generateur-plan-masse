@@ -1,4 +1,6 @@
-streamlit
+streamlit==1.60.0
+streamlit-image-coordinates
 shapely>=2.0
 matplotlib
 pandas
+Pillow

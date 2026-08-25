@@ -14,9 +14,16 @@ def render_plan(result, parcel_xy, access_pt):
     k = r["kpis"]
     xs = [p[0] for p in parcel_xy]
     ys = [p[1] for p in parcel_xy]
-    mx, my = (max(xs) - min(xs)) * 0.08 + 3, (max(ys) - min(ys)) * 0.08 + 3
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    pad = 0.06 * max(w, h) + 2
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    # taille de figure proportionnelle au terrain -> pas de deformation ni de
+    # cadrage etrange, et la parcelle entiere est toujours visible
+    span_x, span_y = w + 2 * pad, h + 2 * pad
+    figw = 7.0
+    figh = max(3.0, min(9.0, figw * span_y / span_x))
+    fig, ax = plt.subplots(figsize=(figw, figh))
 
     # parcelle (rouge epais)
     ax.add_patch(MplPoly(parcel_xy, fill=False, ec="#c0392b", lw=3, zorder=2))
@@ -42,12 +49,12 @@ def render_plan(result, parcel_xy, access_pt):
                 color="white", fontsize=7, fontweight="bold", zorder=6)
     # cheminements pietons (serpentent du parking vers chaque coursive)
     for line in r.get("cheminements", []):
-        xs, ys = line.xy
-        ax.plot(xs, ys, color="#16a085", lw=2.2, ls=(0, (4, 2)), zorder=6.5, alpha=0.9)
+        lx, ly = line.xy
+        ax.plot(lx, ly, color="#16a085", lw=2.2, ls=(0, (4, 2)), zorder=6.5, alpha=0.9)
     # coursive centrale de chaque batiment
     for corr in r.get("corridors", []):
-        xs, ys = corr.xy
-        ax.plot(xs, ys, color="#ffffff", lw=1.4, ls=":", zorder=6.6, alpha=0.9)
+        lx, ly = corr.xy
+        ax.plot(lx, ly, color="#ffffff", lw=1.4, ls=":", zorder=6.6, alpha=0.9)
     # accas
     if access_pt is not None:
         ax.plot(access_pt[0], access_pt[1], "v", color="#e67e22", ms=13, zorder=7)
@@ -55,8 +62,8 @@ def render_plan(result, parcel_xy, access_pt):
                     ha="center", color="#e67e22", fontsize=8, fontweight="bold")
 
     ax.set_aspect("equal")
-    ax.set_xlim(min(xs) - mx, max(xs) + mx)
-    ax.set_ylim(min(ys) - my, max(ys) + my)
+    ax.set_xlim(min(xs) - pad, max(xs) + pad)
+    ax.set_ylim(min(ys) - pad, max(ys) + pad)
     ax.grid(True, alpha=0.25)
     ax.set_xlabel("metres")
     return fig
