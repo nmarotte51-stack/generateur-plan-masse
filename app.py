@@ -18,9 +18,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPoly, Circle
 from PIL import Image, ImageDraw
-from shapely.geometry import Polygon, box, Point, LineString
+from shapely.geometry import Polygon, box, Point, LineString, MultiPoint
 from shapely.affinity import rotate
-from shapely.ops import unary_union, nearest_points
+from shapely.ops import unary_union, nearest_points, voronoi_diagram
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==================================================================
@@ -290,6 +290,22 @@ def compute_feasibility(parcel_xy, access_pt, params):
     occ += [s.buffer(0.6) for s in best["cheminements"]]
     verts = parcel.difference(unary_union(occ)) if occ else parcel
     res["espaces_verts_all"] = verts if (verts and not verts.is_empty) else None
+
+    # parcellaire privatif : cellules de Voronoi autour de chaque batiment,
+    # clippees a la parcelle -> limites = haies (aspect lotissement)
+    plots = []
+    if len(best["buildings"]) >= 2:
+        try:
+            cents = MultiPoint([b[1].centroid for b in best["buildings"]])
+            vor = voronoi_diagram(cents, envelope=parcel.buffer(2))
+            for cell in vor.geoms:
+                c = cell.intersection(parcel)
+                if not c.is_empty and c.area > 1:
+                    plots.append(c)
+        except Exception:
+            plots = []
+    res["plots"] = plots
+
     res["kpis"] = _kpis(res)
     return res
 
@@ -371,13 +387,19 @@ def render_plan(result, parcel_xy, access_pt):
     xs = [p[0] for p in parcel_xy]
     ys = [p[1] for p in parcel_xy]
     w, h = max(xs) - min(xs), max(ys) - min(ys)
+    cxp, cyp = sum(xs) / len(xs), sum(ys) / len(ys)
     pad = 0.08 * max(w, h) + 4
     figw = 8.2
     figh = max(3.6, min(10.5, figw * (h + 2 * pad) / (w + 2 * pad)))
     fig, ax = plt.subplots(figsize=(figw, figh))
 
     ax.add_patch(MplPoly(parcel_xy, fc=C_LAWN, ec="none", zorder=1))
-    _fill(ax, r.get("zone"), fill=False, ec=C_ZONE, lw=1.1, ls=(0, (6, 4)), alpha=0.65, zorder=1.5)
+    # parcellaire privatif : haies entre lots
+    for pl in r.get("plots", []):
+        for g in _polys(pl):
+            hx, hy = g.exterior.xy
+            ax.plot(hx, hy, color="#6f9153", lw=1.3, alpha=0.85, zorder=1.7)
+    _fill(ax, r.get("zone"), fill=False, ec=C_ZONE, lw=1.1, ls=(0, (6, 4)), alpha=0.6, zorder=1.6)
     _fill(ax, r.get("voirie"), fc=C_ENROBE, ec="none", zorder=2)
     _fill(ax, r.get("parking"), fc=C_ENROBE, ec="#2a2d31", lw=1, zorder=2.1)
     _fill(ax, r.get("mail"), fc=C_MAIL, ec="#b8a271", lw=1, zorder=2.3)
@@ -414,9 +436,26 @@ def render_plan(result, parcel_xy, access_pt):
         ax.annotate("ACCES", access_pt, textcoords="offset points", xytext=(0, -15),
                     ha="center", color="#d35400", fontsize=8, fontweight="bold", zorder=7)
 
+    # arbres d'alignement le long du perimetre (dans les zones vertes)
+    occ = [b[1] for b in r["buildings"]]
+    for key in ("parking", "voirie", "mail"):
+        if r.get(key) is not None:
+            occ.append(r[key])
+    occ_u = unary_union(occ) if occ else None
+    peri = Polygon(parcel_xy)
+    ring = peri.exterior
+    ntrees = max(4, int(ring.length / 15))
+    for i in range(ntrees):
+        pt = ring.interpolate((i + 0.5) / ntrees, normalized=True)
+        d = math.hypot(cxp - pt.x, cyp - pt.y) or 1.0
+        tx = pt.x + (cxp - pt.x) / d * 3.0
+        ty = pt.y + (cyp - pt.y) / d * 3.0
+        p2 = Point(tx, ty)
+        if peri.contains(p2) and (occ_u is None or not occ_u.buffer(1.5).contains(p2)):
+            _tree(ax, tx, ty, r=1.5)
+
     # limite parcellaire + COTES
     ax.add_patch(MplPoly(parcel_xy, fill=False, ec=C_PARC, lw=3, zorder=8))
-    cxp, cyp = sum(xs) / len(xs), sum(ys) / len(ys)
     pts = list(parcel_xy)
     for i in range(len(pts)):
         x1, y1 = pts[i]
@@ -486,8 +525,9 @@ def load_background(up):
         img = Image.frombytes("RGB", (pxm.width, pxm.height), pxm.samples)
     else:
         img = Image.open(up).convert("RGB")
+    native_w = img.width
     dh = int(img.height * DW / img.width)
-    return img.resize((DW, dh)), dh
+    return img.resize((DW, dh)), dh, native_w
 
 
 st.sidebar.title("Parametres")
@@ -501,8 +541,17 @@ if mode == "Dessiner sur un plan":
         st.info("1) importer le plan  2) calibrer (cote de reference : 2 points + longueur reelle)  "
                 "3) cliquer les sommets  4) placer l'acces.")
         st.stop()
-    base, dh = load_background(up)
+    base, dh, native_w = load_background(up)
+    is_pdf = up.name.lower().endswith(".pdf")
     st.subheader("Calibrage & trace")
+
+    # --- ECHELLE ---
+    mpp_auto = None
+    if is_pdf:
+        echelle = st.number_input("Echelle d'edition du PDF (1 : ?)", min_value=50, value=500,
+                                  step=50, help="Ex. cadastre = 1:500. Calage automatique, sans mesure.")
+        mpp_auto = echelle * 0.0254 / DPI * (native_w / DW)   # exact pour un PDF a l'echelle
+
     action = st.radio("Le clic sert a :", ["Cote de reference (2 points)", "Sommet de la parcelle",
                                            "Placer l'acces voiture"], horizontal=True)
     c1, c2, c3, c4 = st.columns(4)
@@ -521,9 +570,13 @@ if mode == "Dessiner sur un plan":
         pixd = math.dist(calib[0], calib[1])
         if pixd > 1:
             mpp = longueur / pixd
-            st.success(f"Echelle verrouillee : plan affiche = {DW * mpp:.1f} m de large.")
-    else:
-        st.warning(f"{len(calib)}/2 points de calibrage. Place la cote de reference d'abord.")
+            st.success(f"Echelle CALIBREE (prioritaire) : plan affiche = {DW * mpp:.1f} m de large.")
+    if mpp is None and mpp_auto is not None:
+        mpp = mpp_auto
+        st.success(f"Echelle AUTOMATIQUE (1:{echelle}) : plan affiche = {DW * mpp:.1f} m de large. "
+                   f"Aucune mesure requise. (Verifiable ci-dessous ; sinon, posez une cote de reference.)")
+    elif mpp is None:
+        st.warning("Image sans echelle : posez une cote de reference (2 points + longueur).")
 
     disp = base.copy(); d = ImageDraw.Draw(disp)
     pts = st.session_state.draw_points
