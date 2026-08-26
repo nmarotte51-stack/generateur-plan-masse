@@ -291,7 +291,8 @@ def compute_feasibility(parcel_xy, access_pt, params):
 
     corridors, cheminements = ([], [])
     if buildings and bay is not None:
-        corridors, cheminements = find_paths(zone, buildings, bay, stalls)
+        corridors, cheminements = find_paths(zone, buildings, bay, stalls,
+                                             angle_deg=angle, dist_inter=p["dist_inter"])
 
     result.update(buildings=buildings, parking=bay, stalls=stalls, voirie=voirie,
                   corridors=corridors, cheminements=cheminements)

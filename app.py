@@ -56,8 +56,7 @@ if mode == "Dessiner sur un plan":
     is_pdf = up.name.lower().endswith(".pdf")
 
     action = st.radio("Le clic sert a :",
-                      ["Sommet de la parcelle", "Placer l'acces voiture"] +
-                      ([] if is_pdf else ["Point de calibrage"]),
+                      ["Sommet de la parcelle", "Placer l'acces voiture", "Point de calibrage"],
                       horizontal=True)
 
     b1, b2, b3, b4 = st.columns(4)
@@ -78,15 +77,26 @@ if mode == "Dessiner sur un plan":
                                   help="Echelle d'origine du plan (cadastre = souvent 1:500).")
         doc = pymupdf.open(stream=up.getvalue(), filetype="pdf")
         page = doc[0]
-        pix = page.get_pixmap(dpi=DPI)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        # echelle AUTOMATIQUE et exacte : mpp_natif = echelle * 25.4mm/pouce / 1000 / DPI
-        mpp_natif = echelle * 0.0254 / DPI
+        pxm = page.get_pixmap(dpi=DPI)
+        img = Image.frombytes("RGB", (pxm.width, pxm.height), pxm.samples)
+        mpp_natif = echelle * 0.0254 / DPI      # exact SI le PDF est vraiment a l'echelle
         dh = int(img.height * DW / img.width)
         base = img.resize((DW, dh))
-        mpp = mpp_natif * (img.width / DW)         # corrige le redimensionnement d'affichage
-        st.success(f"Echelle PDF automatique (1:{echelle}) : le plan affiche fait "
-                   f"{DW*mpp:.0f} m de large. Aucun calibrage a faire.")
+        mpp = mpp_natif * (img.width / DW)
+        st.caption("Echelle auto depuis 1:{}. Si l'impression A4/A3 a change l'echelle, "
+                   "corrigez en calibrant 2 points sur le quadrillage cadastral "
+                   "(50 m entre deux croix).".format(echelle))
+        # override par calibrage si l'utilisateur a place 2 points
+        calib = st.session_state.calib_pts
+        if len(calib) == 2:
+            dref = st.number_input("Distance reelle entre les 2 points de calibrage (m)",
+                                   min_value=0.1, value=50.0, step=1.0)
+            pixd = ((calib[0][0] - calib[1][0]) ** 2 + (calib[0][1] - calib[1][1]) ** 2) ** 0.5
+            if pixd > 1:
+                mpp = dref / pixd
+                st.success(f"Echelle CALIBREE (prioritaire) : plan affiche = {DW*mpp:.0f} m de large.")
+        else:
+            st.success(f"Echelle auto (1:{echelle}) : plan affiche = {DW*mpp:.0f} m de large.")
     else:
         img = Image.open(up).convert("RGB")
         dh = int(img.height * DW / img.width)
@@ -113,7 +123,7 @@ if mode == "Dessiner sur un plan":
         d.line(pts + ([pts[0]] if ferme and len(pts) >= 3 else []), fill=(230, 80, 30), width=3)
     for (px, py) in pts:
         d.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(230, 80, 30), outline="white")
-    calib = st.session_state.calib_pts if not is_pdf else []
+    calib = st.session_state.calib_pts
     if len(calib) >= 1:
         if len(calib) == 2:
             d.line(calib, fill=(20, 130, 200), width=3)
@@ -204,7 +214,10 @@ voirie_larg = st.sidebar.slider("Largeur voirie interne (m)", 3.0, 8.0, 5.0, 0.5
 
 st.sidebar.subheader("4. Batiments autorises")
 enabled = [n for n in BUILDINGS if st.sidebar.checkbox(
-    f"{n} ({BUILDINGS[n]['log']} lgt - {BUILDINGS[n]['w']}x{BUILDINGS[n]['h']}m)", value=True)]
+    f"{n} ({BUILDINGS[n]['log']} lgt - {BUILDINGS[n]['w']}x{BUILDINGS[n]['h']}m)",
+    value=True, key=f"bat_{n}")]
+if enabled:
+    st.sidebar.caption("Types actifs : " + ", ".join(enabled))
 
 # ==================================================================
 # CALCUL + AFFICHAGE
