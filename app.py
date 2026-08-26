@@ -191,69 +191,101 @@ def _layout(parcel, zone, access_pt, ang, p):
     Rb = lambda g: rotate(g, ang, origin=origin)
     zone_r = R(zone)
     zx0, zy0, zx1, zy1 = zone_r.bounds
-    gap, mail_w = p["dist_inter"], p["mail_larg"]
-    walk = max(1.2, (gap - mail_w) / 2 + 0.5)
+    gap = p["dist_inter"]
+    vw = p["voirie_larg"]                 # voirie interne CARROSSABLE (centrale)
+    gd, gw = GARAGE["d"], GARAGE["w"]
+    pd, pw = PLACE["d"], PLACE["w"]
+    ped, gapbg = 1.80, 0.6                 # chemin pieton 1.80 m ; jeu garage/bati
     types = sorted(p["enabled"], key=lambda t: -BUILDINGS[t]["log"])
     ces_cap = p["ces_max"] * parcel.area if p["ces_max"] < 1.0 else float("inf")
 
-    def cap_ces(bl):
-        bl = sorted(bl, key=lambda b: -b[1].area)
+    def cap_ces(rows):
+        rows = sorted(rows, key=lambda r: -r[0][1].area)
         kept, s = [], 0.0
-        for b in bl:
-            if s + b[1].area <= ces_cap + 1e-6:
-                kept.append(b); s += b[1].area
+        for r in rows:
+            if s + r[0][1].area <= ces_cap + 1e-6:
+                kept.append(r); s += r[0][1].area
         return kept
 
-    def do_rows(pocket_r, my):
-        nu, nd = my + mail_w / 2 + walk, my - mail_w / 2 - walk
-        pa = []
-        up = _place_row(zone_r, pocket_r, pa, +1, nu, zx0, zx1, types, gap, zy0, zy1)
-        dn = _place_row(zone_r, pocket_r, pa, -1, nd, zx0, zx1, types, gap, zy0, zy1)
-        return up + dn
-
-    mail_y = (zy0 + zy1) / 2.0
-    rows = cap_ces(do_rows(None, mail_y))
-    L = sum(b[2] for b in rows)
-    bay, stalls = None, []
-    for _ in range(6):
-        bay, stalls = parking_pocket(zone, parcel, access_pt, max(L, 1), ang)
-        pocket_r = R(bay) if bay is not None else None
-        r2 = cap_ces(do_rows(pocket_r, mail_y))
-        L2 = sum(b[2] for b in r2)
-        if L2 == L:
-            rows = r2
-            break
-        rows, L = r2, L2
+    voie_y = (zy0 + zy1) / 2.0
+    side_off = vw / 2 + gd + gapbg          # de l'axe voirie a la facade du bati
+    ax = R(Point(access_pt))
+    vis_depth = 11.0                         # poche visiteurs reservee a l'entree
+    if abs(ax.x - zx0) <= abs(ax.x - zx1):
+        astart, adir = zx0, +1
+        vis_r = box(zx0, zy0, zx0 + vis_depth, zy1).intersection(zone_r)
+    else:
+        astart, adir = zx1, -1
+        vis_r = box(zx1 - vis_depth, zy0, zx1, zy1).intersection(zone_r)
+    placed_all, rows = [], []
+    for s in (+1, -1):                       # une rangee de chaque cote de la voirie
+        nf = voie_y + s * side_off
+        r = _place_row(zone_r, vis_r, placed_all, s, nf, zx0, zx1, types, gap, zy0, zy1)
+        rows += [(b, s) for b in r]
+    rows = cap_ces(rows)
     if not rows:
-        return {"buildings": [], "L": 0, "parking": bay, "stalls": stalls,
+        return {"buildings": [], "L": 0, "parking": None, "stalls": [],
                 "voirie": None, "mail": None, "cheminements": [], "corridors": []}
 
-    xs = [b[3][0] for b in rows]
-    x_lo, x_hi = min(xs), max(xs)
-    if bay is not None:
-        x_lo = min(x_lo, R(bay).centroid.x)
-    mail_r = box(x_lo, mail_y - mail_w / 2, x_hi, mail_y + mail_w / 2).intersection(zone_r)
-    mail_world = Rb(mail_r) if (mail_r is not None and not mail_r.is_empty) else None
+    b_bounds = [b[1].bounds for b, s in rows]
+    x_lo = min(bb[0] for bb in b_bounds)
+    x_hi = max(bb[2] for bb in b_bounds)
 
-    stubs = []
-    for b in rows:
-        ex, ey = b[3]
-        side = 1 if ey > mail_y else -1
-        edge_y = mail_y + (mail_w / 2) * side
-        seg = LineString([(ex, edge_y), (ex, ey)])
-        if seg.length > 0.01:
-            stubs.append(Rb(seg))
+    # --- garages accoles (1 / logement, cote voirie) + chemins pietons -------
+    garages, peds = [], []
+    for (name, foot, log, ent, wx), s in rows:
+        bx0, _, bx1, _ = foot.bounds
+        bxc = (bx0 + bx1) / 2
+        band = voie_y + s * vw / 2
+        gy0, gy1 = (band, band + gd) if s > 0 else (band - gd, band)
+        total = log * gw
+        gx = max(bx0, bxc - total / 2)
+        for _ in range(log):
+            gb = box(gx, gy0, gx + gw, gy1)
+            if zone_r.contains(gb.buffer(-0.05)):
+                garages.append(gb)
+            gx += gw
+        p0 = voie_y + s * vw / 2
+        peds.append(box(bxc - ped / 2, min(p0, ent[1]), bxc + ped / 2, max(p0, ent[1])))
 
-    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b in rows]
+    # --- voirie carrossable centrale + amorce depuis l'acces ----------------
+    voirie_r = box(min(x_lo, astart), voie_y - vw / 2,
+                   max(x_hi, astart), voie_y + vw / 2).intersection(zone_r)
+
+    # --- places VISITEURS dans la poche reservee a l'entree (1 / 3 log) ------
+    L = sum(b[2] for b, s in rows)
+    n_vis = (L + 2) // 3
+    forbidden = unary_union([b[1] for b, s in rows] + garages + [voirie_r,
+                box(min(x_lo, astart), voie_y - vw / 2 - gd, max(x_hi, astart), voie_y + vw / 2 + gd)])
+    visitors = []
+    if vis_r is not None and not vis_r.is_empty:
+        vminx, vminy, vmaxx, vmaxy = vis_r.bounds
+        y = vminy + 0.3
+        while y + pd <= vmaxy + 1e-6 and len(visitors) < n_vis:
+            x = vminx + 0.3
+            while x + pw <= vmaxx + 1e-6 and len(visitors) < n_vis:
+                vb = box(x, y, x + pw, y + pd)
+                if vis_r.contains(vb.buffer(-0.05)) and vb.distance(forbidden) > 0.3:
+                    visitors.append(vb)
+                x += pw + 0.12
+            y += pd + 3.0
+
+    # --- retour repere reel -------------------------------------------------
+    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b, s in rows]
     corridors = [central_axis(x[1]) for x in bw]
-    voirie = None
-    if bay is not None:
-        voirie = LineString([access_pt, (bay.centroid.x, bay.centroid.y)]).buffer(
-            p["voirie_larg"] / 2, cap_style=2).intersection(parcel)
-        voirie = voirie if not voirie.is_empty else None
-    return {"buildings": bw, "L": sum(b[2] for b in bw), "parking": bay,
-            "stalls": stalls, "voirie": voirie, "mail": mail_world,
-            "cheminements": stubs, "corridors": corridors}
+    voirie_world = Rb(voirie_r) if not voirie_r.is_empty else None
+    throat = LineString([access_pt, (Rb(Point((astart, voie_y))).x, Rb(Point((astart, voie_y))).y)]
+                        ).buffer(vw / 2, cap_style=2).intersection(parcel)
+    if voirie_world is not None and not throat.is_empty:
+        voirie_world = unary_union([voirie_world, throat])
+    elif voirie_world is None and not throat.is_empty:
+        voirie_world = throat
+
+    stalls = [("garage", Rb(g)) for g in garages] + [("place", Rb(v)) for v in visitors]
+    cheminements = [Rb(pb) for pb in peds]
+    return {"buildings": bw, "L": L, "parking": None, "stalls": stalls,
+            "voirie": voirie_world, "mail": None,
+            "cheminements": cheminements, "corridors": corridors}
 
 
 def compute_feasibility(parcel_xy, access_pt, params):
@@ -404,10 +436,14 @@ def render_plan(result, parcel_xy, access_pt):
     _fill(ax, r.get("parking"), fc=C_ENROBE, ec="#2a2d31", lw=1, zorder=2.1)
     _fill(ax, r.get("mail"), fc=C_MAIL, ec="#b8a271", lw=1, zorder=2.3)
     for seg in r.get("cheminements", []):
-        _fill(ax, seg.buffer(0.8, cap_style=2), fc=C_MAIL, ec="none", zorder=2.3)
+        _fill(ax, seg, fc=C_MAIL, ec="#c3ad82", lw=0.4, zorder=2.35)
     for kind, s in r.get("stalls", []):
-        ax.add_patch(MplPoly(list(s.exterior.coords),
-                     fc=C_GARAGE if kind == "garage" else C_PLACE, ec="white", lw=0.5, zorder=3))
+        if kind == "garage":
+            ax.add_patch(MplPoly(list(s.exterior.coords), fc="#9c6b47", ec="#5a3a22",
+                         lw=0.6, hatch="////", zorder=3))
+        else:
+            ax.add_patch(MplPoly(list(s.exterior.coords), fc=C_PLACE, ec="#8a9199",
+                         lw=0.5, zorder=3))
 
     # arbres dans les jardins (cote oppose au mail), deterministe
     for name, g, log, ent in r["buildings"]:
@@ -703,7 +739,7 @@ with ck:
     st.subheader("Indicateurs")
     a, b = st.columns(2)
     a.metric("Logements", k["nb_logements"])
-    b.metric("Places / Garages", f'{k["nb_places"]} / {k["nb_garages"]}')
+    b.metric("Garages / Visiteurs", f'{k["nb_garages"]} / {k["nb_places"]}')
     a.metric("Surface parcelle", f'{k["surface_parcelle_m2"]:.0f} m2')
     b.metric("Surface batie", f'{k["surface_batie_m2"]:.0f} m2')
     a.metric("Emprise au sol", f'{k["emprise_au_sol_pct"]:.1f} %')
