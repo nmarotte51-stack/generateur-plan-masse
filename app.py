@@ -185,17 +185,33 @@ def _place_row(zone_r, pocket_r, placed_all, side, near_y, x_lo, x_hi,
     return placed
 
 
+def _largest_or_union(g):
+    if g is None or g.is_empty:
+        return None
+    if g.geom_type in ("Polygon", "MultiPolygon"):
+        return g
+    if g.geom_type == "GeometryCollection":
+        polys = [x for x in g.geoms if x.geom_type in ("Polygon", "MultiPolygon")]
+        return unary_union(polys) if polys else None
+    return None
+
+
 def _layout(parcel, zone, access_pt, ang, p):
+    """Aménagement adaptatif : voirie(s) carrossable(s) en peigne, 1 a N rangees
+    selon la profondeur du terrain. Garages accoles (1/log) cote voirie, places
+    visiteurs a l'entree (1/3 log), chemins pietons 1.80 m vers le milieu de facade.
+    Garantit un placement des que la zone peut contenir un produit."""
     origin = zone.centroid.coords[0]
     R = lambda g: rotate(g, -ang, origin=origin)
     Rb = lambda g: rotate(g, ang, origin=origin)
     zone_r = R(zone)
     zx0, zy0, zx1, zy1 = zone_r.bounds
+    H = zy1 - zy0
     gap = p["dist_inter"]
-    vw = p["voirie_larg"]                 # voirie interne CARROSSABLE (centrale)
+    vw = p["voirie_larg"]
     gd, gw = GARAGE["d"], GARAGE["w"]
     pd, pw = PLACE["d"], PLACE["w"]
-    ped, gapbg = 1.80, 0.6                 # chemin pieton 1.80 m ; jeu garage/bati
+    ped, gapbg = 1.80, 0.6
     types = sorted(p["enabled"], key=lambda t: -BUILDINGS[t]["log"])
     ces_cap = p["ces_max"] * parcel.area if p["ces_max"] < 1.0 else float("inf")
 
@@ -207,75 +223,99 @@ def _layout(parcel, zone, access_pt, ang, p):
                 kept.append(r); s += r[0][1].area
         return kept
 
-    voie_y = (zy0 + zy1) / 2.0
-    side_off = vw / 2 + gd + gapbg          # de l'axe voirie a la facade du bati
+    # profondeur de reference = plus grand petit-cote parmi les produits actifs
+    Db = max(min(BUILDINGS[t]["w"], BUILDINGS[t]["h"]) for t in p["enabled"])
+    Db_min = min(min(BUILDINGS[t]["w"], BUILDINGS[t]["h"]) for t in p["enabled"])
+    strip = gd + gapbg
+    unit1 = vw + strip + Db_min       # 1 rangee minimum (produit le plus petit)
+    unit2 = vw + 2 * (strip + Db)     # 2 rangees confortables
+
     ax = R(Point(access_pt))
-    vis_depth = 11.0                         # poche visiteurs reservee a l'entree
-    if abs(ax.x - zx0) <= abs(ax.x - zx1):
-        astart, adir = zx0, +1
-        vis_r = box(zx0, zy0, zx0 + vis_depth, zy1).intersection(zone_r)
+    astart = zx0 if abs(ax.x - zx0) <= abs(ax.x - zx1) else zx1
+
+    empty = {"buildings": [], "L": 0, "parking": None, "stalls": [], "voirie": None,
+             "mail": None, "cheminements": [], "corridors": []}
+    if H >= unit2 - 0.5:                       # terrain profond : peigne double
+        pitch = vw + 2 * (strip + Db) + gap
+        n = max(1, int((H + gap) // pitch))
+        total = n * pitch - gap
+        first = zy0 + (H - total) / 2.0 + strip + Db + vw / 2
+        lanes = [(first + i * pitch, [+1, -1]) for i in range(n)]
+    elif H >= unit1 - 0.5:                     # peu profond : une seule rangee
+        if abs(ax.y - zy0) <= abs(ax.y - zy1):
+            lanes = [(zy0 + vw / 2, [+1])]
+        else:
+            lanes = [(zy1 - vw / 2, [-1])]
     else:
-        astart, adir = zx1, -1
-        vis_r = box(zx1 - vis_depth, zy0, zx1, zy1).intersection(zone_r)
+        return empty
+
     placed_all, rows = [], []
-    for s in (+1, -1):                       # une rangee de chaque cote de la voirie
-        nf = voie_y + s * side_off
-        r = _place_row(zone_r, vis_r, placed_all, s, nf, zx0, zx1, types, gap, zy0, zy1)
-        rows += [(b, s) for b in r]
+    for vy, sides in lanes:
+        for s in sides:
+            nf = vy + s * (vw / 2 + strip)
+            r = _place_row(zone_r, None, placed_all, s, nf, zx0, zx1, types, gap, zy0, zy1)
+            rows += [(bb, s, vy) for bb in r]
     rows = cap_ces(rows)
     if not rows:
-        return {"buildings": [], "L": 0, "parking": None, "stalls": [],
-                "voirie": None, "mail": None, "cheminements": [], "corridors": []}
+        return empty
 
-    b_bounds = [b[1].bounds for b, s in rows]
-    x_lo = min(bb[0] for bb in b_bounds)
-    x_hi = max(bb[2] for bb in b_bounds)
-
-    # --- garages accoles (1 / logement, cote voirie) + chemins pietons -------
+    # garages accoles : exactement 1 par logement, centres sous le bati cote voirie
     garages, peds = [], []
-    for (name, foot, log, ent, wx), s in rows:
+    for (name, foot, log, ent, wx), s, vy in rows:
         bx0, _, bx1, _ = foot.bounds
         bxc = (bx0 + bx1) / 2
-        band = voie_y + s * vw / 2
+        band = vy + s * vw / 2
         gy0, gy1 = (band, band + gd) if s > 0 else (band - gd, band)
         total = log * gw
-        gx = max(bx0, bxc - total / 2)
+        gx = min(max(bx0, bxc - total / 2), bx1 - total) if bx1 - total > bx0 else bx0
         for _ in range(log):
-            gb = box(gx, gy0, gx + gw, gy1)
-            if zone_r.contains(gb.buffer(-0.05)):
-                garages.append(gb)
+            garages.append(box(gx, gy0, gx + gw, gy1))
             gx += gw
-        p0 = voie_y + s * vw / 2
+        p0 = vy + s * vw / 2
         peds.append(box(bxc - ped / 2, min(p0, ent[1]), bxc + ped / 2, max(p0, ent[1])))
 
-    # --- voirie carrossable centrale + amorce depuis l'acces ----------------
-    voirie_r = box(min(x_lo, astart), voie_y - vw / 2,
-                   max(x_hi, astart), voie_y + vw / 2).intersection(zone_r)
+    # voirie(s) carrossable(s) par lane + liaison au droit de l'acces
+    voirie_rects = []
+    used_lanes = sorted({vy for _, _, vy in rows})
+    for vy in used_lanes:
+        lb = [foot for (name, foot, log, ent, wx), s, v in rows if abs(v - vy) < 1e-6]
+        xlo = min(f.bounds[0] for f in lb)
+        xhi = max(f.bounds[2] for f in lb)
+        voirie_rects.append(box(min(xlo, astart), vy - vw / 2, max(xhi, astart), vy + vw / 2))
+    if len(used_lanes) > 1:
+        cx0 = zx0 if astart == zx0 else astart - vw
+        voirie_rects.append(box(cx0, min(used_lanes) - vw / 2, cx0 + vw, max(used_lanes) + vw / 2))
+    voirie_r = _largest_or_union(unary_union(voirie_rects).intersection(zone_r))
 
-    # --- places VISITEURS dans la poche reservee a l'entree (1 / 3 log) ------
-    L = sum(b[2] for b, s in rows)
+    # places VISITEURS (1/3 log) : placees dans le vert, au plus pres de l'acces
+    L = sum(b[2] for b, s, vy in rows)
     n_vis = (L + 2) // 3
-    forbidden = unary_union([b[1] for b, s in rows] + garages + [voirie_r,
-                box(min(x_lo, astart), voie_y - vw / 2 - gd, max(x_hi, astart), voie_y + vw / 2 + gd)])
-    visitors = []
-    if vis_r is not None and not vis_r.is_empty:
-        vminx, vminy, vmaxx, vmaxy = vis_r.bounds
-        y = vminy + 0.3
-        while y + pd <= vmaxy + 1e-6 and len(visitors) < n_vis:
-            x = vminx + 0.3
-            while x + pw <= vmaxx + 1e-6 and len(visitors) < n_vis:
-                vb = box(x, y, x + pw, y + pd)
-                if vis_r.contains(vb.buffer(-0.05)) and vb.distance(forbidden) > 0.3:
-                    visitors.append(vb)
-                x += pw + 0.12
-            y += pd + 3.0
+    occ = [b[1] for b, s, vy in rows] + garages
+    if voirie_r is not None:
+        occ.append(voirie_r)
+    free_r = zone_r.difference(unary_union(occ).buffer(0.4))
+    cands = []
+    if free_r is not None and not free_r.is_empty:
+        minx, miny, maxx, maxy = zone_r.bounds
+        yy = miny + 0.2
+        while yy + pd <= maxy + 1e-6:
+            xx = minx + 0.2
+            while xx + pw <= maxx + 1e-6:
+                vb = box(xx, yy, xx + pw, yy + pd)
+                if free_r.contains(vb):
+                    cands.append(vb)
+                xx += pw + 0.1
+            yy += pd + 0.4
+    cands.sort(key=lambda vb: (vb.centroid.x - ax.x) ** 2 + (vb.centroid.y - ax.y) ** 2)
+    visitors = cands[:n_vis]
 
     # --- retour repere reel -------------------------------------------------
-    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b, s in rows]
+    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b, s, vy in rows]
     corridors = [central_axis(x[1]) for x in bw]
-    voirie_world = Rb(voirie_r) if not voirie_r.is_empty else None
-    throat = LineString([access_pt, (Rb(Point((astart, voie_y))).x, Rb(Point((astart, voie_y))).y)]
-                        ).buffer(vw / 2, cap_style=2).intersection(parcel)
+    voirie_world = Rb(voirie_r) if voirie_r is not None and not voirie_r.is_empty else None
+    nearest_vy = min(used_lanes, key=lambda v: abs(v - ax.y))
+    thr_pt = Rb(Point((astart, nearest_vy)))
+    throat = LineString([access_pt, (thr_pt.x, thr_pt.y)]).buffer(vw / 2, cap_style=2).intersection(parcel)
     if voirie_world is not None and not throat.is_empty:
         voirie_world = unary_union([voirie_world, throat])
     elif voirie_world is None and not throat.is_empty:
@@ -286,6 +326,7 @@ def _layout(parcel, zone, access_pt, ang, p):
     return {"buildings": bw, "L": L, "parking": None, "stalls": stalls,
             "voirie": voirie_world, "mail": None,
             "cheminements": cheminements, "corridors": corridors}
+
 
 
 def compute_feasibility(parcel_xy, access_pt, params):
