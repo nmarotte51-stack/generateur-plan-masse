@@ -197,10 +197,12 @@ def _largest_or_union(g):
 
 
 def _layout(parcel, zone, access_pt, ang, p):
-    """Aménagement adaptatif : voirie(s) carrossable(s) en peigne, 1 a N rangees
-    selon la profondeur du terrain. Garages accoles (1/log) cote voirie, places
-    visiteurs a l'entree (1/3 log), chemins pietons 1.80 m vers le milieu de facade.
-    Garantit un placement des que la zone peut contenir un produit."""
+    """Modele VRD-minimise (cf. cahier des charges) :
+      - POCHE de stationnement UNIQUE et compacte a l'acces : 1 garage + 1 place
+        standard par logement (la seule zone carrossable / grise) ;
+      - MAIL PIETON central (sans voiture) ; les batiments se font face de part
+        et d'autre ; cheminements 1.80 m orthogonaux vers le milieu de facade ;
+      - garages DANS la poche (non accoles). Adaptatif : 1 a N rangees."""
     origin = zone.centroid.coords[0]
     R = lambda g: rotate(g, -ang, origin=origin)
     Rb = lambda g: rotate(g, ang, origin=origin)
@@ -208,125 +210,133 @@ def _layout(parcel, zone, access_pt, ang, p):
     zx0, zy0, zx1, zy1 = zone_r.bounds
     H = zy1 - zy0
     gap = p["dist_inter"]
-    vw = p["voirie_larg"]
-    gd, gw = GARAGE["d"], GARAGE["w"]
-    pd, pw = PLACE["d"], PLACE["w"]
-    ped, gapbg = 1.80, 0.6
+    mail_w = min(p.get("mail_larg", 3.0), 3.0)     # mail PIETON
+    walk = 1.80                                    # cheminement 1.80 m
     types = sorted(p["enabled"], key=lambda t: -BUILDINGS[t]["log"])
     ces_cap = p["ces_max"] * parcel.area if p["ces_max"] < 1.0 else float("inf")
 
     def cap_ces(rows):
         rows = sorted(rows, key=lambda r: -r[0][1].area)
-        kept, s = [], 0.0
+        kept, ss = [], 0.0
         for r in rows:
-            if s + r[0][1].area <= ces_cap + 1e-6:
-                kept.append(r); s += r[0][1].area
+            if ss + r[0][1].area <= ces_cap + 1e-6:
+                kept.append(r); ss += r[0][1].area
         return kept
 
-    # profondeur de reference = plus grand petit-cote parmi les produits actifs
     Db = max(min(BUILDINGS[t]["w"], BUILDINGS[t]["h"]) for t in p["enabled"])
     Db_min = min(min(BUILDINGS[t]["w"], BUILDINGS[t]["h"]) for t in p["enabled"])
-    strip = gd + gapbg
-    unit1 = vw + strip + Db_min       # 1 rangee minimum (produit le plus petit)
-    unit2 = vw + 2 * (strip + Db)     # 2 rangees confortables
-
-    ax = R(Point(access_pt))
-    astart = zx0 if abs(ax.x - zx0) <= abs(ax.x - zx1) else zx1
+    unit1 = mail_w + walk + Db_min
+    unit2 = mail_w + 2 * (walk + Db)
 
     empty = {"buildings": [], "L": 0, "parking": None, "stalls": [], "voirie": None,
-             "mail": None, "cheminements": [], "corridors": []}
-    if H >= unit2 - 0.5:                       # terrain profond : peigne double
-        pitch = vw + 2 * (strip + Db) + gap
+             "mail": None, "hedges": [], "cheminements": [], "corridors": []}
+
+    ay = R(Point(access_pt)).y
+    if H >= unit2 - 0.5:                            # peigne : mails paralleles
+        pitch = mail_w + 2 * (walk + Db) + gap
         n = max(1, int((H + gap) // pitch))
         total = n * pitch - gap
-        first = zy0 + (H - total) / 2.0 + strip + Db + vw / 2
+        first = zy0 + (H - total) / 2.0 + walk + Db + mail_w / 2
         lanes = [(first + i * pitch, [+1, -1]) for i in range(n)]
-    elif H >= unit1 - 0.5:                     # peu profond : une seule rangee
-        if abs(ax.y - zy0) <= abs(ax.y - zy1):
-            lanes = [(zy0 + vw / 2, [+1])]
-        else:
-            lanes = [(zy1 - vw / 2, [-1])]
+    elif H >= unit1 - 0.5:                          # 1 rangee : mail cote OPPOSE a l'acces
+        access_low = abs(ay - zy0) <= abs(ay - zy1)
+        lanes = [(zy1 - mail_w / 2, [-1])] if access_low else [(zy0 + mail_w / 2, [+1])]
     else:
         return empty
 
-    placed_all, rows = [], []
-    for vy, sides in lanes:
-        for s in sides:
-            nf = vy + s * (vw / 2 + strip)
-            r = _place_row(zone_r, None, placed_all, s, nf, zx0, zx1, types, gap, zy0, zy1)
-            rows += [(bb, s, vy) for bb in r]
-    rows = cap_ces(rows)
-    if not rows:
+    def do_rows(pocket_r):
+        placed_all, rows = [], []
+        for vy, sides in lanes:
+            for sdir in sides:
+                nf = vy + sdir * (mail_w / 2 + walk)
+                r = _place_row(zone_r, pocket_r, placed_all, sdir, nf, zx0, zx1,
+                               types, gap, zy0, zy1)
+                rows += [(b, sdir, vy) for b in r]
+        return cap_ces(rows)
+
+    # equilibre batiments <-> poche 1:1:1 (recherche dichotomique) : plus grand L
+    # tel qu'en reservant la poche pour L on peut encore batir >= L logements.
+    def _cap(Lt):
+        if Lt <= 0:
+            return sum(b[2] for b, sd, vy in do_rows(None))
+        bR, _ = parking_pocket(zone, parcel, access_pt, Lt, ang)
+        return sum(b[2] for b, sd, vy in do_rows(R(bR) if bR is not None else None))
+    L0 = _cap(0)
+    if L0 == 0:
         return empty
+    lo, hi, best = 0, L0, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _cap(mid) >= mid:
+            best = mid; lo = mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:                          # parcelle trop juste : batiments prioritaires
+        rows = do_rows(None)
+        L = sum(b[2] for b, sd, vy in rows)
+        bay, stalls = None, []
+    else:
+        bay, stalls = parking_pocket(zone, parcel, access_pt, best, ang)
+        rows_all = do_rows(R(bay) if bay is not None else None)
+        rows, acc = [], 0
+        for r in rows_all:                 # garde exactement 'best' logements (1:1:1)
+            if acc + r[0][2] <= best:
+                rows.append(r); acc += r[0][2]
+        L = sum(b[2] for b, sd, vy in rows)
+        bay, stalls = parking_pocket(zone, parcel, access_pt, max(L, 1), ang)
 
-    # garages accoles : exactement 1 par logement, centres sous le bati cote voirie
-    garages, peds = [], []
-    for (name, foot, log, ent, wx), s, vy in rows:
-        bx0, _, bx1, _ = foot.bounds
-        bxc = (bx0 + bx1) / 2
-        band = vy + s * vw / 2
-        gy0, gy1 = (band, band + gd) if s > 0 else (band - gd, band)
-        total = log * gw
-        gx = min(max(bx0, bxc - total / 2), bx1 - total) if bx1 - total > bx0 else bx0
-        for _ in range(log):
-            garages.append(box(gx, gy0, gx + gw, gy1))
-            gx += gw
-        p0 = vy + s * vw / 2
-        peds.append(box(bxc - ped / 2, min(p0, ent[1]), bxc + ped / 2, max(p0, ent[1])))
-
-    # voirie(s) carrossable(s) par lane + liaison au droit de l'acces
-    voirie_rects = []
-    used_lanes = sorted({vy for _, _, vy in rows})
-    for vy in used_lanes:
-        lb = [foot for (name, foot, log, ent, wx), s, v in rows if abs(v - vy) < 1e-6]
+    # mail(s) pietons : bande centrale couvrant l'emprise des rangees
+    used = sorted({vy for _, _, vy in rows})
+    mail_rects = []
+    for vy in used:
+        lb = [foot for (nm, foot, lg, en, wd), sd, v in rows if abs(v - vy) < 1e-6]
         xlo = min(f.bounds[0] for f in lb)
         xhi = max(f.bounds[2] for f in lb)
-        voirie_rects.append(box(min(xlo, astart), vy - vw / 2, max(xhi, astart), vy + vw / 2))
-    if len(used_lanes) > 1:
-        cx0 = zx0 if astart == zx0 else astart - vw
-        voirie_rects.append(box(cx0, min(used_lanes) - vw / 2, cx0 + vw, max(used_lanes) + vw / 2))
-    voirie_r = _largest_or_union(unary_union(voirie_rects).intersection(zone_r))
+        mail_rects.append(box(xlo, vy - mail_w / 2, xhi, vy + mail_w / 2))
+    mail_r = _largest_or_union(unary_union(mail_rects).intersection(zone_r))
+    mail_world = Rb(mail_r) if mail_r is not None and not mail_r.is_empty else None
 
-    # places VISITEURS (1/3 log) : placees dans le vert, au plus pres de l'acces
-    L = sum(b[2] for b, s, vy in rows)
-    n_vis = (L + 2) // 3
-    occ = [b[1] for b, s, vy in rows] + garages
-    if voirie_r is not None:
-        occ.append(voirie_r)
-    free_r = zone_r.difference(unary_union(occ).buffer(0.4))
-    cands = []
-    if free_r is not None and not free_r.is_empty:
-        minx, miny, maxx, maxy = zone_r.bounds
-        yy = miny + 0.2
-        while yy + pd <= maxy + 1e-6:
-            xx = minx + 0.2
-            while xx + pw <= maxx + 1e-6:
-                vb = box(xx, yy, xx + pw, yy + pd)
-                if free_r.contains(vb):
-                    cands.append(vb)
-                xx += pw + 0.1
-            yy += pd + 0.4
-    cands.sort(key=lambda vb: (vb.centroid.x - ax.x) ** 2 + (vb.centroid.y - ax.y) ** 2)
-    visitors = cands[:n_vis]
-
-    # --- retour repere reel -------------------------------------------------
-    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b, s, vy in rows]
-    corridors = [central_axis(x[1]) for x in bw]
-    voirie_world = Rb(voirie_r) if voirie_r is not None and not voirie_r.is_empty else None
-    nearest_vy = min(used_lanes, key=lambda v: abs(v - ax.y))
-    thr_pt = Rb(Point((astart, nearest_vy)))
-    throat = LineString([access_pt, (thr_pt.x, thr_pt.y)]).buffer(vw / 2, cap_style=2).intersection(parcel)
-    if voirie_world is not None and not throat.is_empty:
-        voirie_world = unary_union([voirie_world, throat])
-    elif voirie_world is None and not throat.is_empty:
-        voirie_world = throat
-
-    stalls = [("garage", Rb(g)) for g in garages] + [("place", Rb(v)) for v in visitors]
+    # cheminements 1.80 m orthogonaux : bord du mail -> entree (milieu de facade)
+    peds = []
+    for (nm, foot, lg, en, wd), sd, vy in rows:
+        ex, ey = en
+        p0 = vy + sd * mail_w / 2
+        peds.append(box(ex - walk / 2, min(p0, ey), ex + walk / 2, max(p0, ey)))
     cheminements = [Rb(pb) for pb in peds]
-    return {"buildings": bw, "L": L, "parking": None, "stalls": stalls,
-            "voirie": voirie_world, "mail": None,
-            "cheminements": cheminements, "corridors": corridors}
 
+    # separations de lots : haies ORTHOGONALES alignees sur la trame
+    from collections import defaultdict as _dd
+    grp = _dd(list)
+    for (nm, foot, lg, en, wd), sd, vy in rows:
+        grp[(vy, sd)].append(foot)
+    hedges = []
+    for (vy, sd), foots in grp.items():
+        foots.sort(key=lambda f: f.bounds[0])
+        near_y = vy + sd * mail_w / 2
+        far_y = zy1 if sd > 0 else zy0
+        ex = []
+        for i in range(len(foots) + 1):
+            if i == 0:
+                xm = foots[0].bounds[0] - gap / 2
+            elif i == len(foots):
+                xm = foots[-1].bounds[2] + gap / 2
+            else:
+                xm = (foots[i - 1].bounds[2] + foots[i].bounds[0]) / 2
+            ex.append(xm)
+        for xm in ex:
+            seg = LineString([(xm, near_y), (xm, far_y)]).intersection(zone_r)
+            if not seg.is_empty and seg.geom_type in ("LineString", "MultiLineString"):
+                hedges.append(Rb(seg))
+        segf = LineString([(ex[0], far_y), (ex[-1], far_y)]).intersection(zone_r)
+        if not segf.is_empty and segf.geom_type in ("LineString", "MultiLineString"):
+            hedges.append(Rb(segf))
+
+    bw = [(b[0], Rb(b[1]), b[2], Rb(Point(b[3])).coords[0]) for b, sd, vy in rows]
+    corridors = [central_axis(x[1]) for x in bw]
+
+    return {"buildings": bw, "L": L, "parking": bay, "stalls": stalls,
+            "voirie": None, "mail": mail_world, "hedges": hedges,
+            "cheminements": cheminements, "corridors": corridors}
 
 
 def compute_feasibility(parcel_xy, access_pt, params):
@@ -364,20 +374,7 @@ def compute_feasibility(parcel_xy, access_pt, params):
     verts = parcel.difference(unary_union(occ)) if occ else parcel
     res["espaces_verts_all"] = verts if (verts and not verts.is_empty) else None
 
-    # parcellaire privatif : cellules de Voronoi autour de chaque batiment,
-    # clippees a la parcelle -> limites = haies (aspect lotissement)
-    plots = []
-    if len(best["buildings"]) >= 2:
-        try:
-            cents = MultiPoint([b[1].centroid for b in best["buildings"]])
-            vor = voronoi_diagram(cents, envelope=parcel.buffer(2))
-            for cell in vor.geoms:
-                c = cell.intersection(parcel)
-                if not c.is_empty and c.area > 1:
-                    plots.append(c)
-        except Exception:
-            plots = []
-    res["plots"] = plots
+    res["hedges"] = best.get("hedges", [])
 
     res["kpis"] = _kpis(res)
     return res
@@ -467,11 +464,13 @@ def render_plan(result, parcel_xy, access_pt):
     fig, ax = plt.subplots(figsize=(figw, figh))
 
     ax.add_patch(MplPoly(parcel_xy, fc=C_LAWN, ec="none", zorder=1))
-    # parcellaire privatif : haies entre lots
-    for pl in r.get("plots", []):
-        for g in _polys(pl):
-            hx, hy = g.exterior.xy
-            ax.plot(hx, hy, color="#6f9153", lw=1.3, alpha=0.85, zorder=1.7)
+    # parcellaire privatif : haies orthogonales entre lots
+    for hg in r.get("hedges", []):
+        parts = hg.geoms if hg.geom_type == "MultiLineString" else [hg]
+        for pc in parts:
+            if pc.geom_type == "LineString":
+                hx, hy = pc.xy
+                ax.plot(hx, hy, color="#6f9153", lw=1.6, alpha=0.9, zorder=1.7)
     _fill(ax, r.get("zone"), fill=False, ec=C_ZONE, lw=1.1, ls=(0, (6, 4)), alpha=0.6, zorder=1.6)
     _fill(ax, r.get("voirie"), fc=C_ENROBE, ec="none", zorder=2)
     _fill(ax, r.get("parking"), fc=C_ENROBE, ec="#2a2d31", lw=1, zorder=2.1)
@@ -486,6 +485,9 @@ def render_plan(result, parcel_xy, access_pt):
             ax.add_patch(MplPoly(list(s.exterior.coords), fc=C_PLACE, ec="#8a9199",
                          lw=0.5, zorder=3))
 
+    # limite pour la vegetation = zone constructible (arbres bornes DANS les limites)
+    zpoly = r.get("zone")
+    tree_zone = zpoly if (zpoly is not None and not zpoly.is_empty) else Polygon(parcel_xy)
     # arbres dans les jardins (cote oppose au mail), deterministe
     for name, g, log, ent in r["buildings"]:
         c = g.centroid
@@ -493,7 +495,7 @@ def render_plan(result, parcel_xy, access_pt):
         n = math.hypot(dx, dy) or 1.0
         maxd = max(g.bounds[2] - g.bounds[0], g.bounds[3] - g.bounds[1])
         tx, ty = c.x + dx / n * (maxd * 0.5 + 2.6), c.y + dy / n * (maxd * 0.5 + 2.6)
-        if Polygon(parcel_xy).contains(Point(tx, ty)):
+        if tree_zone.contains(Point(tx, ty)):
             _tree(ax, tx, ty)
 
     off = 0.018 * max(w, h) + 0.4
@@ -513,23 +515,23 @@ def render_plan(result, parcel_xy, access_pt):
         ax.annotate("ACCES", access_pt, textcoords="offset points", xytext=(0, -15),
                     ha="center", color="#d35400", fontsize=8, fontweight="bold", zorder=7)
 
-    # arbres d'alignement le long du perimetre (dans les zones vertes)
+    # arbres d'alignement le long de la ZONE constructible (dans les limites)
     occ = [b[1] for b in r["buildings"]]
     for key in ("parking", "voirie", "mail"):
         if r.get(key) is not None:
             occ.append(r[key])
     occ_u = unary_union(occ) if occ else None
-    peri = Polygon(parcel_xy)
-    ring = peri.exterior
-    ntrees = max(4, int(ring.length / 15))
-    for i in range(ntrees):
-        pt = ring.interpolate((i + 0.5) / ntrees, normalized=True)
-        d = math.hypot(cxp - pt.x, cyp - pt.y) or 1.0
-        tx = pt.x + (cxp - pt.x) / d * 3.0
-        ty = pt.y + (cyp - pt.y) / d * 3.0
-        p2 = Point(tx, ty)
-        if peri.contains(p2) and (occ_u is None or not occ_u.buffer(1.5).contains(p2)):
-            _tree(ax, tx, ty, r=1.5)
+    ring = tree_zone.exterior if tree_zone.geom_type == "Polygon" else None
+    if ring is not None:
+        ntrees = max(4, int(ring.length / 15))
+        for i in range(ntrees):
+            pt = ring.interpolate((i + 0.5) / ntrees, normalized=True)
+            d = math.hypot(cxp - pt.x, cyp - pt.y) or 1.0
+            tx = pt.x + (cxp - pt.x) / d * 2.2
+            ty = pt.y + (cyp - pt.y) / d * 2.2
+            p2 = Point(tx, ty)
+            if tree_zone.contains(p2) and (occ_u is None or not occ_u.buffer(1.2).contains(p2)):
+                _tree(ax, tx, ty, r=1.5)
 
     # limite parcellaire + COTES
     ax.add_patch(MplPoly(parcel_xy, fill=False, ec=C_PARC, lw=3, zorder=8))
